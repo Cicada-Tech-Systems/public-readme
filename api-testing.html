@@ -1,0 +1,1128 @@
+         '/mobile/your-endpoint',             // API path
+         { key: 'value' },                    // Request body
+         'mobile',                            // Auth: null | 'mobile' | 'backend'
+         [200, 400],                          // Acceptable status codes
+         d => { /* extract data from response */ }
+       );
+
+DEVICE MAC:
+  The test uses 'AA:BB:CC:DD:E0:01' (simulated BedDot in the database).
+  After delete-account, the device is released back to user_id=NULL.
+================================================================================
+-->
+
+<style>
+  /* ---- Theme Variables ---- */
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --yellow: #d29922;
+    --input-bg: #0d1117;
+  }
+
+  /* ---- Reset & Base ---- */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.6; padding: 20px; max-width: 900px; margin: 0 auto;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 2px; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 20px; }
+
+  /* ---- Setup Card ---- */
+  .setup-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 20px; margin-bottom: 20px;
+  }
+  .setup-card h2 { font-size: 1rem; margin-bottom: 12px; }
+  .form-row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .form-row .field { flex: 1; min-width: 200px; }
+  .form-row label { font-size: 0.75rem; color: var(--muted); display: block; margin-bottom: 2px; }
+
+  /* ---- Inputs & Buttons ---- */
+  input {
+    background: var(--input-bg); border: 1px solid var(--border); color: var(--text);
+    border-radius: 4px; padding: 8px 10px; font-size: 0.9rem; width: 100%;
+  }
+  input:focus { border-color: var(--accent); outline: none; }
+  input:disabled { opacity: 0.5; }
+  button {
+    border: none; border-radius: 6px; padding: 10px 24px;
+    cursor: pointer; font-size: 0.9rem; font-weight: 600;
+  }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-secondary { background: var(--border); color: var(--text); }
+  .btn-small { padding: 6px 14px; font-size: 0.8rem; }
+
+  /* ---- Modals (OTP & SMS) ---- */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+    display: none; align-items: center; justify-content: center; z-index: 100;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 24px; width: 360px; text-align: center;
+  }
+  .modal h3 { margin-bottom: 8px; }
+  .modal p { color: var(--muted); font-size: 0.85rem; margin-bottom: 16px; }
+  .modal input { text-align: center; font-size: 1.4rem; letter-spacing: 8px; margin-bottom: 12px; }
+  .modal .error-msg { color: var(--red); font-size: 0.8rem; margin-bottom: 8px; min-height: 1.2em; }
+
+  /* ---- Progress Bar ---- */
+  .progress-bar { background: var(--border); border-radius: 4px; height: 6px; margin-bottom: 20px; overflow: hidden; }
+  .progress-fill { background: var(--green); height: 100%; width: 0%; transition: width 0.3s; }
+
+  /* ---- Stats Row ---- */
+  .stats { display: flex; gap: 16px; margin-bottom: 16px; font-size: 0.85rem; }
+  .stat { padding: 6px 12px; border-radius: 4px; background: var(--card); border: 1px solid var(--border); }
+  .stat .n { font-weight: 700; font-size: 1.1rem; }
+  .stat.pass .n { color: var(--green); }
+  .stat.fail .n { color: var(--red); }
+  .stat.skip .n { color: var(--yellow); }
+
+  /* ---- Test Log ---- */
+  #testLog { max-height: 70vh; overflow-y: auto; }
+  .test-section { margin-bottom: 12px; }
+  .test-section-header {
+    font-size: 0.8rem; font-weight: 700; color: var(--accent);
+    text-transform: uppercase; letter-spacing: 1px;
+    padding: 6px 0; border-bottom: 1px solid var(--border); margin-bottom: 4px;
+  }
+  .test-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 4px 8px; border-radius: 4px; font-size: 0.82rem;
+    margin-bottom: 2px; cursor: pointer;
+  }
+  .test-row:hover { background: rgba(255,255,255,0.03); }
+  .test-icon { flex-shrink: 0; width: 18px; text-align: center; font-weight: 700; }
+  .test-icon.pass { color: var(--green); }
+  .test-icon.fail { color: var(--red); }
+  .test-icon.skip { color: var(--yellow); }
+  .test-icon.run { color: var(--accent); }
+  .test-name { flex: 1; font-family: monospace; }
+  .test-status { font-size: 0.75rem; color: var(--muted); }
+  .test-detail {
+    display: none; background: #000; border: 1px solid var(--border);
+    border-radius: 4px; padding: 8px; margin: 4px 0 4px 26px;
+    font-family: monospace; font-size: 0.72rem;
+    white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto;
+  }
+  .test-detail.open { display: block; }
+
+  /* ---- Spinner (for running tests) ---- */
+  .spinner {
+    display: inline-block; width: 14px; height: 14px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg) } }
+</style>
+</head>
+<body>
+
+<!-- ============================================================ -->
+<!-- SETUP FORM — Collects test email, password, optional phone   -->
+<!-- ============================================================ -->
+<h1>BedDot API Test Runner</h1>
+<p class="subtitle">Automated test script for all mobile endpoints. Create a test account, enter OTP, and watch it run.</p>
+
+<div class="setup-card" id="setupCard">
+  <h2>Test Setup</h2>
+  <div class="form-row">
+    <div class="field">
+      <label>Base URL</label>
+      <input id="baseUrl" value="" placeholder="Leave empty for same-origin, or enter https://your-server.com">
+    </div>
+  </div>
+  <div class="form-row">
+    <div class="field">
+      <label>Test Email</label>
+      <input id="testEmail" placeholder="testuser@example.com">
+    </div>
+    <div class="field">
+      <label>Test Password (min 8 chars)</label>
+      <input id="testPassword" type="password" value="TestPass123!">
+    </div>
+  </div>
+  <div class="form-row">
+    <div class="field">
+      <label>Phone Number for SMS OTP (optional, e.g. +14155551234)</label>
+      <input id="testPhone" placeholder="+1...">
+    </div>
+  </div>
+  <div class="form-row" style="margin-top:12px;gap:10px;">
+    <button class="btn-primary" id="btnStart" onclick="startTests()">Run All Tests</button>
+    <button class="btn-secondary btn-small" id="btnSkipAuth" onclick="startWithLogin()"
+            title="Skip signup, just login with existing account">Login Existing Account</button>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- EMAIL OTP MODAL — Shown after signup to collect OTP code     -->
+<!-- ============================================================ -->
+<div class="modal-overlay" id="otpModal">
+  <div class="modal">
+    <h3>Enter Email OTP Code</h3>
+    <p>Check your email for the 6-digit verification code.</p>
+    <input id="otpInput" maxlength="6" placeholder="000000" autofocus>
+    <div style="display:flex;gap:8px;justify-content:center;">
+      <button class="btn-primary" onclick="submitOtp()">Verify</button>
+      <button class="btn-secondary btn-small" onclick="resendOtp()">Resend</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SMS CODE MODAL — Shown after Firebase sends SMS              -->
+<!-- ============================================================ -->
+<div class="modal-overlay" id="smsModal">
+  <div class="modal">
+    <h3>Enter SMS Verification Code</h3>
+    <p>Firebase sent a 6-digit code to <span id="smsPhoneDisplay"></span></p>
+    <div class="error-msg" id="smsError"></div>
+    <input id="smsInput" maxlength="6" placeholder="000000">
+    <div style="display:flex;gap:8px;justify-content:center;">
+      <button class="btn-primary" onclick="submitSmsCode()">Verify</button>
+    </div>
+  </div>
+</div>
+
+<!-- Invisible reCAPTCHA container (required by Firebase Phone Auth) -->
+<div id="recaptcha-container"></div>
+
+<!-- ============================================================ -->
+<!-- RESULTS AREA — Progress bar, stats, scrollable test log      -->
+<!-- ============================================================ -->
+<div id="resultsArea" style="display:none;">
+  <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+  <div class="stats">
+    <div class="stat pass"><span class="n" id="passCount">0</span> passed</div>
+    <div class="stat fail"><span class="n" id="failCount">0</span> failed</div>
+    <div class="stat skip"><span class="n" id="skipCount">0</span> skipped</div>
+    <div class="stat"><span class="n" id="totalCount">0</span> / <span id="totalTests">30</span></div>
+  </div>
+  <div id="testLog"></div>
+  <div style="margin-top:16px;text-align:center;" id="doneArea"></div>
+</div>
+
+<!-- ============================================================ -->
+<!-- FIREBASE SDK (compat mode for simple <script> usage)         -->
+<!-- Used for phone number verification via SMS OTP               -->
+<!-- ============================================================ -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+
+<script>
+// =====================================================================
+// (a) CONFIGURATION
+// =====================================================================
+
+/** Firebase web app config — public keys (not secret). */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyBEYBO86KBpNvcNBrQe9mJZDy-q3u3CBXs",
+  authDomain: "home-dots.firebaseapp.com",
+  projectId: "home-dots",
+  storageBucket: "home-dots.firebasestorage.app",
+  messagingSenderId: "1058812347824",
+  appId: "1:1058812347824:web:75d722417cc195adf68275"
+};
+
+firebase.initializeApp(FIREBASE_CONFIG);
+const firebaseAuth = firebase.auth();
+
+/** MAC address of the simulated BedDot device in the database. */
+const TEST_DEVICE_MAC = 'AA:BB:CC:DD:E0:01';
+
+/** Total expected tests for progress bar (approximate). */
+const TOTAL_TESTS_FULL = 30;
+const TOTAL_TESTS_LOGIN = 27; // Skip signup/otp/resend
+
+// =====================================================================
+// (b) STATE — mutable session state populated during the test run
+// =====================================================================
+
+let BASE = '';              // Server base URL (empty = same-origin)
+let testEmail = '';         // Email entered in setup form
+let testPassword = '';      // Password entered in setup form
+let testPhone = '';         // Phone number (E.164 format) or empty
+
+let accessToken = '';       // Mobile JWT access token
+let refreshToken = '';      // Refresh token for /auth/refresh-token
+let userId = '';            // mobile_user_id from JWT
+let userName = '';          // user_name used by backend-auth endpoints
+let backendToken = '';      // Backend token (if returned separately)
+
+let testDeviceMac = '';     // Resolved device MAC (from add-device or get-devices-with-alerts)
+let testDeviceId = '';      // Resolved device ID
+let testGroupId = '';       // Group ID from create-group
+let testAlertId = '';       // Alert ID from get-alerts-by-device
+
+let passed = 0, failed = 0, skipped = 0, total = 0;
+let totalExpected = TOTAL_TESTS_FULL;
+
+// Promise resolvers for modal input
+let otpResolve = null;
+let smsResolve = null;
+let confirmationResult = null; // Firebase SMS confirmation handle
+
+// =====================================================================
+// (c) DOM HELPERS
+// =====================================================================
+
+/** Shorthand for getElementById. */
+function $(id) { return document.getElementById(id); }
+
+/** Escape HTML to prevent XSS in test detail output. */
+function escHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Async delay helper. */
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * Normalize phone number to E.164 format.
+ * Strips non-digit/plus chars and prepends +1 (US) if no country code.
+ */
+function normalizePhone(raw) {
+  const cleaned = raw.trim().replace(/[^+\d]/g, '');
+  if (!cleaned) return '';
+  return cleaned.startsWith('+') ? cleaned : '+1' + cleaned;
+}
+
+// =====================================================================
+// (d) API CLIENT — single reusable function for all endpoint calls
+// =====================================================================
+
+/**
+ * Call a BedDot API endpoint.
+ *
+ * @param {string} path      - API path, e.g. '/mobile/auth/signup'
+ * @param {object} body      - JSON request body
+ * @param {string|null} auth - Auth mode: null (none), 'mobile' (JWT), 'backend' (JWT/legacy)
+ * @returns {{ status: number, data: object|string }}
+ *
+ * EXAMPLE USAGE (from browser console):
+ *   const { status, data } = await api('/mobile/auth/login',
+ *     { email: 'user@example.com', password: 'MyPass123!' }, null);
+ */
+async function api(path, body, auth) {
+  const headers = { 'Content-Type': 'application/json' };
+
+  // Attach auth header based on mode
+  if (auth === 'mobile' && accessToken) {
+    headers['Authorization'] = 'Bearer ' + accessToken;
+  } else if (auth === 'backend' && (accessToken || backendToken)) {
+    headers['Authorization'] = 'Bearer ' + (accessToken || backendToken);
+  }
+
+  const resp = await fetch(BASE + path, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  const text = await resp.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+  return { status: resp.status, data };
+}
+
+// =====================================================================
+// (e) TOKEN STORAGE — extract tokens from response data
+// =====================================================================
+
+/**
+ * Store auth tokens returned from login/signup/refresh/verify endpoints.
+ * Response shape varies by endpoint but typically includes:
+ *   { access_token, refresh_token, backend_token, user: { id, email }, mobile_user_id }
+ */
+function storeTokens(d) {
+  if (d.access_token) accessToken = d.access_token;
+  if (d.refresh_token) refreshToken = d.refresh_token;
+  if (d.backend_token) backendToken = d.backend_token;
+  if (d.user) {
+    userId = d.user.id || d.user.mobile_user_id || userId;
+    userName = d.user.email || userName;
+  }
+  if (d.mobile_user_id) userId = d.mobile_user_id;
+}
+
+// =====================================================================
+// (f) UI / LOGGING — progress bar, stats, test log output
+// =====================================================================
+
+let currentSection = null;
+
+/** Add a section header (e.g. "Phase 1: Authentication"). */
+function logSection(name) {
+  currentSection = document.createElement('div');
+  currentSection.className = 'test-section';
+  currentSection.innerHTML = '<div class="test-section-header">' + name + '</div>';
+  $('testLog').appendChild(currentSection);
+}
+
+/** Log a completed test result (pass/fail/skip). Click row to expand detail. */
+function logTest(name, status, statusCode, detail) {
+  total++;
+  if (status === 'pass') passed++;
+  else if (status === 'fail') failed++;
+  else skipped++;
+
+  const id = 'detail-' + total;
+  const icons = { pass: '+', fail: 'x', skip: '-' };
+  const labels = {
+    pass: statusCode + ' OK',
+    fail: statusCode + ' FAIL',
+    skip: 'SKIP',
+  };
+
+  const row = document.createElement('div');
+  const detailStr = typeof detail === 'object' ? JSON.stringify(detail, null, 2) : String(detail);
+  row.innerHTML =
+    '<div class="test-row" onclick="toggleDetail(\'' + id + '\')">' +
+      '<span class="test-icon ' + status + '">' + icons[status] + '</span>' +
+      '<span class="test-name">' + name + '</span>' +
+      '<span class="test-status">' + labels[status] + '</span>' +
+    '</div>' +
+    '<div class="test-detail" id="' + id + '">' + escHtml(detailStr) + '</div>';
+
+  currentSection.appendChild(row);
+  updateStats();
+  $('testLog').scrollTop = $('testLog').scrollHeight;
+}
+
+/** Show a spinner row while a test is running. Returns the row element for removal. */
+function logRunning(name) {
+  const row = document.createElement('div');
+  row.className = 'test-row running-row';
+  row.innerHTML =
+    '<span class="test-icon run"><span class="spinner"></span></span>' +
+    '<span class="test-name">' + name + '</span>' +
+    '<span class="test-status">running...</span>';
+  currentSection.appendChild(row);
+  $('testLog').scrollTop = $('testLog').scrollHeight;
+  return row;
+}
+
+/** Remove a running-spinner row after the test completes. */
+function removeRunning(row) {
+  if (row && row.parentNode) row.parentNode.removeChild(row);
+}
+
+/** Update the stats counters and progress bar. */
+function updateStats() {
+  $('passCount').textContent = passed;
+  $('failCount').textContent = failed;
+  $('skipCount').textContent = skipped;
+  $('totalCount').textContent = total;
+  $('progressFill').style.width = Math.round((total / totalExpected) * 100) + '%';
+}
+
+/** Toggle detail panel visibility on click. */
+function toggleDetail(id) { $(id).classList.toggle('open'); }
+
+// =====================================================================
+// (g) MODAL HANDLERS — Email OTP and Firebase SMS code prompts
+// =====================================================================
+
+/**
+ * Show the OTP modal and wait for the user to enter the 6-digit code.
+ * Returns a Promise that resolves with the code string.
+ */
+function waitForOtp() {
+  return new Promise(resolve => {
+    otpResolve = resolve;
+    $('otpModal').classList.add('show');
+    $('otpInput').value = '';
+    $('otpInput').focus();
+  });
+}
+
+/** Validate and submit the OTP code from the modal. */
+function submitOtp() {
+  const code = $('otpInput').value.trim();
+  if (code.length !== 6 || !/^\d{6}$/.test(code)) {
+    $('otpInput').style.borderColor = 'var(--red)';
+    return;
+  }
+  $('otpModal').classList.remove('show');
+  if (otpResolve) { otpResolve(code); otpResolve = null; }
+}
+
+/** Resend the OTP email and flash a green border on success. */
+async function resendOtp() {
+  await api('/mobile/auth/resend-otp', { email: testEmail, otp_type: 'signup' }, null);
+  $('otpInput').style.borderColor = 'var(--green)';
+  setTimeout(() => $('otpInput').style.borderColor = '', 1500);
+}
+
+/**
+ * Send an SMS verification code via Firebase Phone Auth.
+ * Uses invisible reCAPTCHA (auto-solved, no user interaction).
+ */
+async function sendSmsCode(phoneNumber) {
+  const recaptchaVerifier = new firebase.auth.RecaptchaVerifier('recaptcha-container', {
+    size: 'invisible',
+  });
+  confirmationResult = await firebaseAuth.signInWithPhoneNumber(phoneNumber, recaptchaVerifier);
+}
+
+/**
+ * Show the SMS modal and wait for the user to enter the 6-digit code.
+ * Returns a Promise that resolves with the Firebase ID token string.
+ */
+function waitForSmsCode() {
+  return new Promise(resolve => {
+    smsResolve = resolve;
+    $('smsPhoneDisplay').textContent = testPhone;
+    $('smsError').textContent = '';
+    $('smsModal').classList.add('show');
+    $('smsInput').value = '';
+    $('smsInput').focus();
+  });
+}
+
+/** Validate the SMS code, confirm with Firebase, and resolve with the ID token. */
+async function submitSmsCode() {
+  const code = $('smsInput').value.trim();
+  if (code.length !== 6 || !/^\d{6}$/.test(code)) {
+    $('smsInput').style.borderColor = 'var(--red)';
+    return;
+  }
+  try {
+    $('smsError').textContent = 'Verifying...';
+    const result = await confirmationResult.confirm(code);
+    const idToken = await result.user.getIdToken();
+    $('smsModal').classList.remove('show');
+    if (smsResolve) { smsResolve(idToken); smsResolve = null; }
+  } catch (err) {
+    $('smsError').textContent = 'Invalid code: ' + (err.message || err);
+    $('smsInput').style.borderColor = 'var(--red)';
+  }
+}
+
+/** Enter key submits whichever modal is open. */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    if ($('otpModal').classList.contains('show')) submitOtp();
+    else if ($('smsModal').classList.contains('show')) submitSmsCode();
+  }
+});
+
+// =====================================================================
+// (h) TEST RUNNER — reusable helpers for executing endpoint tests
+// =====================================================================
+
+/**
+ * Run a single API test with logging, spinner, and status check.
+ *
+ * @param {string}           name         - Display name, e.g. 'POST /mobile/auth/signup'
+ * @param {string}           path         - API path, e.g. '/mobile/auth/signup'
+ * @param {object}           body         - JSON request body
+ * @param {string|null}      auth         - Auth mode: null | 'mobile' | 'backend'
+ * @param {number|number[]}  expectStatus - Acceptable HTTP status code(s)
+ * @param {function}         [extractor]  - Optional callback to extract data on success
+ * @returns {{ ok: boolean, status: number, data: object }}
+ */
+async function runTest(name, path, body, auth, expectStatus, extractor) {
+  const row = logRunning(name);
+  await sleep(100);
+  try {
+    const { status, data } = await api(path, body, auth);
+    removeRunning(row);
+    const ok = Array.isArray(expectStatus) ? expectStatus.includes(status) : status === expectStatus;
+    logTest(name, ok ? 'pass' : 'fail', status, data);
+    if (ok && extractor) extractor(data);
+    return { ok, status, data };
+  } catch (err) {
+    removeRunning(row);
+    logTest(name, 'fail', 0, err.message);
+    return { ok: false, status: 0, data: null };
+  }
+}
+
+/** Log a skipped test with a reason. */
+function skipTest(name, reason) {
+  logTest(name, 'skip', '', reason || 'skipped');
+}
+
+/**
+ * Run a test only if a prerequisite value exists, otherwise skip.
+ * Reduces repeated if/else blocks for device-dependent tests.
+ *
+ * @param {*}      prerequisite - Value that must be truthy (e.g. testDeviceId)
+ * @param {string} skipReason   - Reason shown when skipped
+ * @param {string} name         - Test display name
+ * @param {string} path         - API path
+ * @param {object} body         - Request body
+ * @param {string} auth         - Auth mode
+ * @param {number|number[]} expectStatus - Acceptable status codes
+ * @param {function} [extractor] - Optional data extractor
+ */
+async function runOrSkip(prerequisite, skipReason, name, path, body, auth, expectStatus, extractor) {
+  if (prerequisite) {
+    return await runTest(name, path, body, auth, expectStatus, extractor);
+  }
+  skipTest(name, skipReason);
+  return { ok: false, status: 0, data: null };
+}
+
+// =====================================================================
+// (i) TEST PHASES — each phase is an async function for readability
+// =====================================================================
+
+// ------------------------------------------------------------------
+// PHASE 1: AUTHENTICATION
+// Endpoints: signup, resend-otp, verify-otp, login, refresh-token,
+//            reset-password, update-password, verify-firebase-token
+// ------------------------------------------------------------------
+async function runPhaseAuth(skipSignup) {
+  logSection('Phase 1: Authentication');
+
+  if (!skipSignup) {
+    // POST /mobile/auth/signup
+    // Body: { email, password }
+    // Auth: none
+    // Creates a new mobile user account. Sends OTP email.
+    await runTest(
+      'POST /mobile/auth/signup', '/mobile/auth/signup',
+      { email: testEmail, password: testPassword },
+      null, [200, 201],
+      d => { if (d.data) storeTokens(d.data); }
+    );
+
+    // POST /mobile/auth/resend-otp
+    // Body: { email, otp_type: 'signup'|'recovery' }
+    // Auth: none
+    // Resends the OTP email. 429 if called within 30s cooldown.
+    await runTest(
+      'POST /mobile/auth/resend-otp', '/mobile/auth/resend-otp',
+      { email: testEmail, otp_type: 'signup' },
+      null, [200, 429]
+    );
+
+    // POST /mobile/auth/verify-otp
+    // Body: { email, otp_code (6 digits), otp_type: 'signup'|'recovery' }
+    // Auth: none
+    // Verifies the OTP and activates the account.
+    const otp = await waitForOtp();
+    await runTest(
+      'POST /mobile/auth/verify-otp', '/mobile/auth/verify-otp',
+      { email: testEmail, otp_code: otp, otp_type: 'signup' },
+      null, 200,
+      d => { if (d.data) storeTokens(d.data); }
+    );
+  }
+
+  // POST /mobile/auth/login
+  // Body: { email, password }
+  // Auth: none
+  // Returns access_token (JWT), refresh_token, and user info.
+  await runTest(
+    'POST /mobile/auth/login', '/mobile/auth/login',
+    { email: testEmail, password: testPassword },
+    null, 200,
+    d => { if (d.data) storeTokens(d.data); userName = testEmail; }
+  );
+
+  // POST /mobile/auth/refresh-token
+  // Body: { mobile_user_id, refresh_token }
+  // Auth: none
+  // Exchanges a refresh token for a new access + refresh token pair.
+  if (refreshToken && userId) {
+    await runTest(
+      'POST /mobile/auth/refresh-token', '/mobile/auth/refresh-token',
+      { mobile_user_id: parseInt(userId), refresh_token: refreshToken },
+      null, 200,
+      d => { if (d.data) storeTokens(d.data); }
+    );
+  } else {
+    skipTest('POST /mobile/auth/refresh-token', 'No refresh token available');
+  }
+
+  // POST /mobile/auth/reset-password
+  // Body: { email }
+  // Auth: none
+  // Sends a password-reset OTP email (does not change the password).
+  await runTest(
+    'POST /mobile/auth/reset-password', '/mobile/auth/reset-password',
+    { email: testEmail },
+    null, 200
+  );
+
+  // POST /mobile/auth/update-password — skipped (requires prior OTP verification)
+  // Body: { email, password (new) }
+  // Auth: none (but server checks password_reset_verified_at timestamp)
+  skipTest('POST /mobile/auth/update-password', 'Requires OTP verification first');
+
+  // Firebase Phone Verification (SMS OTP)
+  // Flow: client sends SMS via Firebase SDK → user enters code → Firebase returns ID token
+  //       → POST /mobile/auth/verify-firebase-token { id_token, mobile_user_id }
+  if (testPhone) {
+    const row = logRunning('Firebase SMS: Sending code to ' + testPhone);
+    try {
+      await sendSmsCode(testPhone);
+      removeRunning(row);
+      logTest('Firebase SMS: Code sent', 'pass', '', 'SMS sent to ' + testPhone);
+
+      const idToken = await waitForSmsCode();
+
+      // POST /mobile/auth/verify-firebase-token
+      // Body: { id_token (from Firebase), mobile_user_id }
+      // Auth: mobile JWT
+      // Links the phone number to the mobile user account.
+      await runTest(
+        'POST /mobile/auth/verify-firebase-token', '/mobile/auth/verify-firebase-token',
+        { id_token: idToken, mobile_user_id: parseInt(userId) || undefined },
+        'mobile', 200,
+        d => { if (d.data) storeTokens(d.data); }
+      );
+    } catch (err) {
+      removeRunning(row);
+      logTest('Firebase SMS: Send code', 'fail', '', 'Firebase error: ' + (err.message || err));
+      skipTest('POST /mobile/auth/verify-firebase-token', 'SMS send failed');
+    }
+  } else {
+    skipTest('Firebase SMS verification', 'No phone number provided');
+    skipTest('POST /mobile/auth/verify-firebase-token', 'No phone number provided');
+  }
+}
+
+// ------------------------------------------------------------------
+// PHASE 2: USER PROFILE
+// Endpoints: get-profile, complete-profile, update-profile, update-status
+// ------------------------------------------------------------------
+async function runPhaseProfile() {
+  logSection('Phase 2: User Profile');
+
+  // POST /mobile/user/get-profile
+  // Body: {} (user identified by JWT)
+  // Auth: mobile JWT
+  await runTest(
+    'POST /mobile/user/get-profile', '/mobile/user/get-profile',
+    {}, 'mobile', 200
+  );
+
+  // POST /mobile/user/complete-profile
+  // Body: { name, age, gender, sleep_goals, wake_time, sleep_time }
+  // Auth: mobile JWT
+  // Sets status from 'verified' → 'profile_completed'. 400 if already completed.
+  await runTest(
+    'POST /mobile/user/complete-profile', '/mobile/user/complete-profile',
+    { name: 'Test User', age: 30, gender: 'male', sleep_goals: '8', wake_time: '07:00', sleep_time: '23:00' },
+    'mobile', [200, 400]
+  );
+
+  // POST /mobile/user/update-profile
+  // Body: { name?, age?, gender?, sleep_goals?, wake_time?, sleep_time? }
+  // Auth: mobile JWT
+  await runTest(
+    'POST /mobile/user/update-profile', '/mobile/user/update-profile',
+    { name: 'Test User Updated', age: 31 },
+    'mobile', 200
+  );
+
+  // POST /mobile/user/update-status
+  // Body: { status: 'not_verified'|'verified'|'profile_completed'|'tutorial_completed' }
+  // Auth: mobile JWT
+  // Status transitions: not_verified → verified → profile_completed → tutorial_completed
+  await runTest(
+    'POST /mobile/user/update-status', '/mobile/user/update-status',
+    { status: 'tutorial_completed' },
+    'mobile', [200, 400]
+  );
+}
+
+// ------------------------------------------------------------------
+// PHASE 3: DEVICES & GROUPS
+// Endpoints: create-group, get-groups, pair-device, add-device,
+//            add-device-to-group, remove-device-from-group,
+//            get-dashboard-stats, delete-group
+// ------------------------------------------------------------------
+async function runPhaseDevices() {
+  logSection('Phase 3: Devices & Groups');
+
+  // POST /mobile/create-group
+  // Body: { user_name, group_name }
+  // Auth: backend (JWT resolves user_name automatically for mobile users)
+  await runTest(
+    'POST /mobile/create-group', '/mobile/create-group',
+    { user_name: userName, group_name: 'Test Group' },
+    'backend', [200, 201],
+    d => { if (d.data && d.data.group_id) testGroupId = d.data.group_id; }
+  );
+
+  // POST /mobile/get-groups
+  // Body: { user_name }
+  // Auth: backend
+  // Returns { groups: [{ id, name, devices: [...] }] }
+  await runTest(
+    'POST /mobile/get-groups', '/mobile/get-groups',
+    { user_name: userName },
+    'backend', 200,
+    d => {
+      if (d.data && d.data.groups && d.data.groups.length > 0) {
+        if (!testGroupId) testGroupId = d.data.groups[0].id;
+        const g = d.data.groups[0];
+        if (g.devices && g.devices.length > 0) {
+          testDeviceId = g.devices[0].id || g.devices[0].device_id;
+          testDeviceMac = g.devices[0].mac || g.devices[0].device_mac || '';
+        }
+      }
+    }
+  );
+
+  // POST /mobile/pair-device
+  // Body: { user_name, pairing_code, device_name }
+  // Auth: backend
+  // Claims a device via its pairing code. 404 if code invalid/expired.
+  await runTest(
+    'POST /mobile/pair-device', '/mobile/pair-device',
+    { user_name: userName, pairing_code: 'TEST01', device_name: 'Test Sensor' },
+    'backend', [200, 201, 400, 404],
+    d => {
+      if (d.data) {
+        testDeviceId = d.data.device_id || testDeviceId;
+        testDeviceMac = d.data.device_mac || testDeviceMac;
+      }
+    }
+  );
+
+  // POST /mobile/add-device
+  // Body: { user_name, device_mac, device_name, group_id? }
+  // Auth: backend
+  // Adds a device by MAC address. Device must exist in device_conf and be unclaimed.
+  await runTest(
+    'POST /mobile/add-device', '/mobile/add-device',
+    { user_name: userName, device_mac: TEST_DEVICE_MAC, device_name: 'API Test Device', group_id: parseInt(testGroupId) || 1 },
+    'backend', [200, 201, 400, 404, 409],
+    d => { if (d.data) testDeviceId = d.data.device_id || d.data.id || testDeviceId; }
+  );
+
+  // POST /mobile/add-device-to-group
+  // Body: { user_name, group_id, device_id }
+  // Auth: backend
+  await runOrSkip(testDeviceId && testGroupId, 'No device_id or group_id',
+    'POST /mobile/add-device-to-group', '/mobile/add-device-to-group',
+    { user_name: userName, group_id: parseInt(testGroupId), device_id: parseInt(testDeviceId) },
+    'backend', [200, 400]
+  );
+
+  // POST /mobile/remove-device-from-group
+  // Body: { user_name, group_id, device_id }
+  // Auth: backend
+  await runOrSkip(testDeviceId && testGroupId, 'No device_id or group_id',
+    'POST /mobile/remove-device-from-group', '/mobile/remove-device-from-group',
+    { user_name: userName, group_id: parseInt(testGroupId), device_id: parseInt(testDeviceId) },
+    'backend', [200, 400]
+  );
+
+  // POST /mobile/get-dashboard-stats
+  // Body: { user_name }
+  // Auth: backend
+  // Returns device count, alert count, etc.
+  await runTest(
+    'POST /mobile/get-dashboard-stats', '/mobile/get-dashboard-stats',
+    { user_name: userName },
+    'backend', [200, 400]
+  );
+
+  // POST /mobile/delete-group
+  // Body: { user_name, group_id }
+  // Auth: backend
+  await runOrSkip(testGroupId, 'No group_id',
+    'POST /mobile/delete-group', '/mobile/delete-group',
+    { user_name: userName, group_id: parseInt(testGroupId) },
+    'backend', [200, 400]
+  );
+}
+
+// ------------------------------------------------------------------
+// PHASE 4: DEVICE USERS & INVITATIONS
+// Endpoints: get-device-users, invite-user, get-invitations,
+//            respond-invitation, update-device-user-role, remove-device-user
+// ------------------------------------------------------------------
+async function runPhaseUsers() {
+  logSection('Phase 4: Device Users & Invitations');
+
+  // POST /mobile/get-device-users
+  // Body: { user_name, device_id }
+  // Auth: backend
+  // Returns list of users with access to this device and their roles.
+  await runOrSkip(testDeviceId, 'No device_id',
+    'POST /mobile/get-device-users', '/mobile/get-device-users',
+    { user_name: userName, device_id: parseInt(testDeviceId) },
+    'backend', [200, 400]
+  );
+
+  // POST /mobile/invite-user
+  // Body: { user_name, device_id, invitee_email, role: 'co-owner'|'viewer'|'caregiver' }
+  // Auth: backend
+  await runOrSkip(testDeviceId, 'No device_id',
+    'POST /mobile/invite-user', '/mobile/invite-user',
+    { user_name: userName, device_id: parseInt(testDeviceId), invitee_email: 'invite-test@example.com', role: 'viewer' },
+    'backend', [200, 400, 404]
+  );
+
+  // POST /mobile/get-invitations
+  // Body: { user_name }
+  // Auth: backend
+  await runTest(
+    'POST /mobile/get-invitations', '/mobile/get-invitations',
+    { user_name: userName },
+    'backend', [200]
+  );
+
+  // POST /mobile/respond-invitation
+  // Body: { user_name, invitation_id, accept: true|false }
+  // Auth: backend
+  await runTest(
+    'POST /mobile/respond-invitation', '/mobile/respond-invitation',
+    { user_name: userName, invitation_id: 99999, accept: false },
+    'backend', [200, 400, 404]
+  );
+
+  // POST /mobile/update-device-user-role
+  // Body: { user_name, device_id, target_user_id, new_role }
+  // Auth: backend
+  // Only device owners/co-owners can change roles.
+  await runOrSkip(testDeviceId, 'No device_id',
+    'POST /mobile/update-device-user-role', '/mobile/update-device-user-role',
+    { user_name: userName, device_id: parseInt(testDeviceId), target_user_id: parseInt(userId) || 1, new_role: 'viewer' },
+    'backend', [200, 400, 403]
+  );
+
+  // POST /mobile/remove-device-user
+  // Body: { user_name, device_id, target_user_id }
+  // Auth: backend
+  await runOrSkip(testDeviceId, 'No device_id',
+    'POST /mobile/remove-device-user', '/mobile/remove-device-user',
+    { user_name: userName, device_id: parseInt(testDeviceId), target_user_id: 99999 },
+    'backend', [200, 400, 403, 404]
+  );
+}
+
+// ------------------------------------------------------------------
+// PHASE 5: ALERTS
+// Endpoints: get-devices-with-alerts, get-alerts-by-device,
+//            get-alert-thresholds, update-alert-thresholds, resolve-alert
+// ------------------------------------------------------------------
+async function runPhaseAlerts() {
+  logSection('Phase 5: Alerts');
+
+  // POST /mobile/get-devices-with-alerts
+  // Body: { user_name }
+  // Auth: backend
+  // Returns all devices the user has access to, with unresolved alert counts.
+  await runTest(
+    'POST /mobile/get-devices-with-alerts', '/mobile/get-devices-with-alerts',
+    { user_name: userName },
+    'backend', [200, 400],
+    d => {
+      if (d.data && d.data.devices && d.data.devices.length > 0) {
+        const dev = d.data.devices[0];
+        if (!testDeviceMac && dev.mac) testDeviceMac = dev.mac;
+        if (!testDeviceMac && dev.device_mac) testDeviceMac = dev.device_mac;
+      }
+    }
+  );
+
+  const alertMac = testDeviceMac || TEST_DEVICE_MAC;
+
+  // POST /mobile/get-alerts-by-device
+  // Body: { user_name, device_mac, limit?, offset? }
+  // Auth: backend
+  // Returns paginated alert history for a device.
+  await runTest(
+    'POST /mobile/get-alerts-by-device', '/mobile/get-alerts-by-device',
+    { user_name: userName, device_mac: alertMac, limit: 10, offset: 0 },
+    'backend', [200, 400, 404],
+    d => {
+      if (d.data && d.data.alerts && d.data.alerts.length > 0) {
+        testAlertId = d.data.alerts[0].id;
+      }
+    }
+  );
+
+  // POST /mobile/get-alert-thresholds
+  // Body: { user_name, device_mac }
+  // Auth: backend
+  await runTest(
+    'POST /mobile/get-alert-thresholds', '/mobile/get-alert-thresholds',
+    { user_name: userName, device_mac: alertMac },
+    'backend', [200, 400, 404]
+  );
+
+  // POST /mobile/update-alert-thresholds
+  // Body: { user_name, device_mac, thresholds: { heart_rate_high, heart_rate_low, ... } }
+  // Auth: backend
+  // Only device owners/co-owners can update thresholds.
+  await runTest(
+    'POST /mobile/update-alert-thresholds', '/mobile/update-alert-thresholds',
+    { user_name: userName, device_mac: alertMac, thresholds: { heart_rate_high: 120, heart_rate_low: 40 } },
+    'backend', [200, 400, 403, 404]
+  );
+
+  // POST /mobile/resolve-alert
+  // Body: { user_name, alert_id }
+  // Auth: backend
+  await runOrSkip(testAlertId, 'No alert_id found',
+    'POST /mobile/resolve-alert', '/mobile/resolve-alert',
+    { user_name: userName, alert_id: parseInt(testAlertId) },
+    'backend', [200, 400]
+  );
+}
+
+// ------------------------------------------------------------------
+// PHASE 6: VITALS
+// Endpoints: get-vitals, export-vitals
+// ------------------------------------------------------------------
+async function runPhaseVitals() {
+  logSection('Phase 6: Vitals');
+
+  const now = Math.floor(Date.now() / 1000);
+  const alertMac = testDeviceMac || TEST_DEVICE_MAC;
+
+  // POST /mobile/get-vitals
+  // Body: { user_name, device_mac, start_timestamp, end_timestamp }
+  // Auth: backend
+  // Reads vitals from InfluxDB. Returns heartrate, respiratory rate, etc.
+  await runTest(
+    'POST /mobile/get-vitals', '/mobile/get-vitals',
+    { user_name: userName, device_mac: alertMac, start_timestamp: now - 86400, end_timestamp: now },
+    'backend', [200, 400, 404]
+  );
+
+  // POST /mobile/export-vitals (stub — not yet implemented)
+  // Body: { user_name, device_mac, start_timestamp, end_timestamp, format }
+  // Auth: backend
+  await runTest(
+    'POST /mobile/export-vitals', '/mobile/export-vitals',
+    { user_name: userName, device_mac: alertMac, start_timestamp: now - 86400, end_timestamp: now, format: 'csv' },
+    'backend', [200, 501]
+  );
+}
+
+// ------------------------------------------------------------------
+// PHASE 7: STUBS (not yet implemented — expect 501)
+// ------------------------------------------------------------------
+async function runPhaseStubs() {
+  logSection('Phase 7: Notification & Sleep Stubs');
+
+  // POST /mobile/notifications/register
+  // Body: { device_token }  Auth: mobile JWT
+  await runTest('POST /mobile/notifications/register', '/mobile/notifications/register',
+    { device_token: 'fake_fcm_token_123' }, 'mobile', [200, 501]);
+
+  // POST /mobile/notifications/preferences
+  // Body: {}  Auth: mobile JWT
+  await runTest('POST /mobile/notifications/preferences', '/mobile/notifications/preferences',
+    {}, 'mobile', [200, 501]);
+
+  // POST /mobile/sleep/analysis
+  // Body: { user_name }  Auth: backend
+  await runTest('POST /mobile/sleep/analysis', '/mobile/sleep/analysis',
+    { user_name: userName }, 'backend', [200, 501]);
+
+  // POST /mobile/sleep/report
+  // Body: { user_name }  Auth: backend
+  await runTest('POST /mobile/sleep/report', '/mobile/sleep/report',
+    { user_name: userName }, 'backend', [200, 501]);
+}
+
+// ------------------------------------------------------------------
+// PHASE 8: CLEANUP — delete the test account
+// ------------------------------------------------------------------
+async function runPhaseCleanup() {
+  logSection('Phase 8: Cleanup');
+
+  // POST /mobile/user/delete-account
+  // Body: {} (user identified by JWT)
+  // Auth: mobile JWT
+  // Soft-deletes the mobile user and releases all owned devices.
+  await runTest(
+    'POST /mobile/user/delete-account', '/mobile/user/delete-account',
+    {}, 'mobile', 200
+  );
+}
+
+// =====================================================================
+// (j) ENTRY POINTS — called by the buttons in the setup form
+// =====================================================================
+
+/** Read form inputs and normalize values before starting tests. */
+function readFormInputs() {
+  testEmail = $('testEmail').value.trim();
+  testPassword = $('testPassword').value.trim();
+  testPhone = normalizePhone($('testPhone').value);
+  BASE = $('baseUrl').value.trim().replace(/\/+$/, '');
+}
+
+/** Lock the setup form and show the results area. */
+function lockUI() {
+  $('btnStart').disabled = true;
+  $('btnSkipAuth').disabled = true;
+  $('setupCard').style.opacity = '0.6';
+  $('resultsArea').style.display = 'block';
+}
+
+/** "Run All Tests" button — full signup flow. */
+async function startTests() {
+  readFormInputs();
+  if (!testEmail || !testPassword || testPassword.length < 8) {
+    alert('Enter a valid email and password (min 8 chars)');
+    return;
+  }
+  totalExpected = TOTAL_TESTS_FULL;
+  $('totalTests').textContent = totalExpected;
+  lockUI();
+  await runAllTests(false);
+}
+
+/** "Login Existing Account" button — skip signup, just login. */
+async function startWithLogin() {
+  readFormInputs();
+  if (!testEmail || !testPassword) {
+    alert('Enter email and password for existing account');
+    return;
+  }
+  totalExpected = TOTAL_TESTS_LOGIN;
+  $('totalTests').textContent = totalExpected;
+  lockUI();
+  await runAllTests(true);
+}
+
+/** Master test orchestrator — runs all phases in sequence. */
+async function runAllTests(skipSignup) {
+  await runPhaseAuth(skipSignup);
+  await runPhaseProfile();
+  await runPhaseDevices();
+  await runPhaseUsers();
+  await runPhaseAlerts();
+  await runPhaseVitals();
+  await runPhaseStubs();
+  await runPhaseCleanup();
+
+  // ---- Done ----
+  $('progressFill').style.width = '100%';
+  const color = failed === 0 ? 'var(--green)' : 'var(--red)';
+  $('doneArea').innerHTML =
+    '<div style="font-size:1.2rem;font-weight:700;color:' + color + ';margin-bottom:8px;">' +
+    (failed === 0 ? 'All tests completed!' : failed + ' test(s) failed') +
+    '</div>' +
+    '<button class="btn-secondary btn-small" onclick="location.reload()">Run Again</button>';
+}
+</script>
+</body>
+</html>
