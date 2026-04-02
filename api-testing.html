@@ -1,3 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BedDot API Test Runner</title>
+
+<!--
+================================================================================
+BedDot API Test Runner — Single-File Test Harness
+================================================================================
+
+FILE ORGANIZATION:
+  1. CSS STYLES          — Dark theme, layout, modals, progress bar, test log
+  2. HTML STRUCTURE       — Setup form, OTP/SMS modals, results area
+  3. FIREBASE SDK         — External compat scripts for phone auth
+  4. JAVASCRIPT           — All logic in one <script> block:
+     a. Configuration     — Firebase config, constants
+     b. State             — Tokens, counters, test context
+     c. DOM Helpers       — $(id), escHtml, sleep
+     d. API Client        — api() wrapper for all endpoint calls
+     e. Token Storage     — storeTokens() extracts tokens from responses
+     f. UI / Logging      — Progress bar, test log, section headers
+     g. Modal Handlers    — Email OTP prompt, Firebase SMS prompt
+     h. Test Runner       — runTest(), skipTest(), runOrSkip() helpers
+     i. Test Phases       — Each phase is a separate async function
+     j. Entry Points      — startTests(), startWithLogin()
+
+AUTHENTICATION MODES:
+  - null       : No auth header (public endpoints like signup, login)
+  - 'mobile'   : Bearer token from mobile JWT (user-facing endpoints)
+  - 'backend'  : Bearer token for backend-auth endpoints (device/group/alert)
+
+HOW TO ADD A NEW ENDPOINT TEST:
+  1. Find the appropriate phase function (e.g., runPhaseAlerts)
+  2. Add a call to runTest() or runOrSkip():
+       await runTest(
+         'POST /mobile/your-endpoint',       // Display name
          '/mobile/your-endpoint',             // API path
          { key: 'value' },                    // Request body
          'mobile',                            // Auth: null | 'mobile' | 'backend'
@@ -244,8 +282,8 @@ const firebaseAuth = firebase.auth();
 const TEST_DEVICE_MAC = 'AA:BB:CC:DD:E0:01';
 
 /** Total expected tests for progress bar (approximate). */
-const TOTAL_TESTS_FULL = 30;
-const TOTAL_TESTS_LOGIN = 27; // Skip signup/otp/resend
+const TOTAL_TESTS_FULL = 42;
+const TOTAL_TESTS_LOGIN = 39; // Skip signup/otp/resend
 
 // =====================================================================
 // (b) STATE — mutable session state populated during the test run
@@ -588,7 +626,7 @@ async function runOrSkip(prerequisite, skipReason, name, path, body, auth, expec
 //            reset-password, update-password, verify-firebase-token
 // ------------------------------------------------------------------
 async function runPhaseAuth(skipSignup) {
-  logSection('Phase 1: Authentication');
+  logSection('1. Auth Flow — Signup → OTP → Login → Refresh → Password Reset');
 
   if (!skipSignup) {
     // POST /mobile/auth/signup
@@ -666,37 +704,9 @@ async function runPhaseAuth(skipSignup) {
   // Auth: none (but server checks password_reset_verified_at timestamp)
   skipTest('POST /mobile/auth/update-password', 'Requires OTP verification first');
 
-  // Firebase Phone Verification (SMS OTP)
-  // Flow: client sends SMS via Firebase SDK → user enters code → Firebase returns ID token
-  //       → POST /mobile/auth/verify-firebase-token { id_token, mobile_user_id }
-  if (testPhone) {
-    const row = logRunning('Firebase SMS: Sending code to ' + testPhone);
-    try {
-      await sendSmsCode(testPhone);
-      removeRunning(row);
-      logTest('Firebase SMS: Code sent', 'pass', '', 'SMS sent to ' + testPhone);
-
-      const idToken = await waitForSmsCode();
-
-      // POST /mobile/auth/verify-firebase-token
-      // Body: { id_token (from Firebase), mobile_user_id }
-      // Auth: mobile JWT
-      // Links the phone number to the mobile user account.
-      await runTest(
-        'POST /mobile/auth/verify-firebase-token', '/mobile/auth/verify-firebase-token',
-        { id_token: idToken, mobile_user_id: parseInt(userId) || undefined },
-        'mobile', 200,
-        d => { if (d.data) storeTokens(d.data); }
-      );
-    } catch (err) {
-      removeRunning(row);
-      logTest('Firebase SMS: Send code', 'fail', '', 'Firebase error: ' + (err.message || err));
-      skipTest('POST /mobile/auth/verify-firebase-token', 'SMS send failed');
-    }
-  } else {
-    skipTest('Firebase SMS verification', 'No phone number provided');
-    skipTest('POST /mobile/auth/verify-firebase-token', 'No phone number provided');
-  }
+  // Google/Apple Sign-In — skipped in automated tests (requires real OAuth tokens)
+  skipTest('POST /mobile/auth/google', 'Requires real Google ID token');
+  skipTest('POST /mobile/auth/apple', 'Requires real Apple ID token');
 }
 
 // ------------------------------------------------------------------
@@ -704,7 +714,7 @@ async function runPhaseAuth(skipSignup) {
 // Endpoints: get-profile, complete-profile, update-profile, update-status
 // ------------------------------------------------------------------
 async function runPhaseProfile() {
-  logSection('Phase 2: User Profile');
+  logSection('2. Profile Flow — Get → Complete → Update → Status');
 
   // POST /mobile/user/get-profile
   // Body: {} (user identified by JWT)
@@ -751,7 +761,7 @@ async function runPhaseProfile() {
 //            get-dashboard-stats, delete-group
 // ------------------------------------------------------------------
 async function runPhaseDevices() {
-  logSection('Phase 3: Devices & Groups');
+  logSection('3. Device Flow — Add → Rename → Groups → Latest Vitals → Stats');
 
   // POST /mobile/create-group
   // Body: { user_name, group_name }
@@ -828,14 +838,41 @@ async function runPhaseDevices() {
     'backend', [200, 400]
   );
 
+  // POST /mobile/update-device
+  // Body: { user_name, device_mac, device_name }
+  // Auth: backend — owner/manager only
+  await runTest(
+    'POST /mobile/update-device', '/mobile/update-device',
+    { user_name: userName, device_mac: DEVICE_MAC, device_name: 'Renamed BedDot' },
+    'backend', [200, 400, 404]
+  );
+
+  // POST /mobile/get-latest-vitals
+  // Body: { user_name }
+  // Auth: backend
+  // Returns latest reading for ALL user's devices in one call.
+  await runTest(
+    'POST /mobile/get-latest-vitals', '/mobile/get-latest-vitals',
+    { user_name: userName },
+    'backend', [200]
+  );
+
   // POST /mobile/get-dashboard-stats
   // Body: { user_name }
   // Auth: backend
-  // Returns device count, alert count, etc.
   await runTest(
     'POST /mobile/get-dashboard-stats', '/mobile/get-dashboard-stats',
     { user_name: userName },
     'backend', [200, 400]
+  );
+
+  // POST /mobile/rename-group
+  // Body: { user_name, group_id, group_name }
+  // Auth: backend
+  await runOrSkip(testGroupId, 'No group_id',
+    'POST /mobile/rename-group', '/mobile/rename-group',
+    { user_name: userName, group_id: parseInt(testGroupId), group_name: 'Renamed Group' },
+    'backend', [200, 400, 404]
   );
 
   // POST /mobile/delete-group
@@ -854,7 +891,7 @@ async function runPhaseDevices() {
 //            respond-invitation, update-device-user-role, remove-device-user
 // ------------------------------------------------------------------
 async function runPhaseUsers() {
-  logSection('Phase 4: Device Users & Invitations');
+  logSection('4. Sharing Flow — Users → Invite → Respond → Role → Remove → Links → Access Request');
 
   // POST /mobile/get-device-users
   // Body: { user_name, device_id }
@@ -867,7 +904,7 @@ async function runPhaseUsers() {
   );
 
   // POST /mobile/invite-user
-  // Body: { user_name, device_id, invitee_email, role: 'co-owner'|'viewer'|'caregiver' }
+  // Body: { user_name, device_id, invitee_email, role: 'manager'|'viewer'|'caregiver' }
   // Auth: backend
   await runOrSkip(testDeviceId, 'No device_id',
     'POST /mobile/invite-user', '/mobile/invite-user',
@@ -896,7 +933,7 @@ async function runPhaseUsers() {
   // POST /mobile/update-device-user-role
   // Body: { user_name, device_id, target_user_id, new_role }
   // Auth: backend
-  // Only device owners/co-owners can change roles.
+  // Only device owners/managers can change roles.
   await runOrSkip(testDeviceId, 'No device_id',
     'POST /mobile/update-device-user-role', '/mobile/update-device-user-role',
     { user_name: userName, device_id: parseInt(testDeviceId), target_user_id: parseInt(userId) || 1, new_role: 'viewer' },
@@ -911,6 +948,26 @@ async function runPhaseUsers() {
     { user_name: userName, device_id: parseInt(testDeviceId), target_user_id: 99999 },
     'backend', [200, 400, 403, 404]
   );
+
+  // POST /mobile/accept-invite-link
+  // Body: { user_name, invite_token }
+  // Auth: backend
+  // Accept a shareable invite link. Anyone with the token can use it.
+  await runTest(
+    'POST /mobile/accept-invite-link', '/mobile/accept-invite-link',
+    { user_name: userName, invite_token: 'nonexistent_token' },
+    'backend', [200, 400, 404]
+  );
+
+  // POST /mobile/request-device-access
+  // Body: { user_name, device_mac, note }
+  // Auth: backend
+  // Request view access to a device owned by someone else.
+  await runTest(
+    'POST /mobile/request-device-access', '/mobile/request-device-access',
+    { user_name: userName, device_mac: 'FF:FF:FF:FF:FF:FF', note: 'Test access request' },
+    'backend', [200, 400, 404]
+  );
 }
 
 // ------------------------------------------------------------------
@@ -919,7 +976,7 @@ async function runPhaseUsers() {
 //            get-alert-thresholds, update-alert-thresholds, resolve-alert
 // ------------------------------------------------------------------
 async function runPhaseAlerts() {
-  logSection('Phase 5: Alerts');
+  logSection('5. Alert Flow — List Devices → Alerts → Thresholds → Acknowledge → Resolve');
 
   // POST /mobile/get-devices-with-alerts
   // Body: { user_name }
@@ -967,7 +1024,7 @@ async function runPhaseAlerts() {
   // POST /mobile/update-alert-thresholds
   // Body: { user_name, device_mac, thresholds: { heart_rate_high, heart_rate_low, ... } }
   // Auth: backend
-  // Only device owners/co-owners can update thresholds.
+  // Only device owners/managers can update thresholds.
   await runTest(
     'POST /mobile/update-alert-thresholds', '/mobile/update-alert-thresholds',
     { user_name: userName, device_mac: alertMac, thresholds: { heart_rate_high: 120, heart_rate_low: 40 } },
@@ -977,6 +1034,15 @@ async function runPhaseAlerts() {
   // POST /mobile/resolve-alert
   // Body: { user_name, alert_id }
   // Auth: backend
+  await runOrSkip(testAlertId, 'No alert_id found',
+    'POST /mobile/acknowledge-alert', '/mobile/acknowledge-alert',
+    { user_name: userName, alert_id: parseInt(testAlertId) },
+    'backend', [200, 400, 403, 404]
+  );
+
+  // POST /mobile/resolve-alert
+  // Body: { user_name, alert_id }
+  // Auth: backend — owner/manager/caregiver only (viewers cannot resolve)
   await runOrSkip(testAlertId, 'No alert_id found',
     'POST /mobile/resolve-alert', '/mobile/resolve-alert',
     { user_name: userName, alert_id: parseInt(testAlertId) },
@@ -989,7 +1055,7 @@ async function runPhaseAlerts() {
 // Endpoints: get-vitals, export-vitals
 // ------------------------------------------------------------------
 async function runPhaseVitals() {
-  logSection('Phase 6: Vitals');
+  logSection('6. Vitals Flow — Query Time Range → Export CSV/JSON');
 
   const now = Math.floor(Date.now() / 1000);
   const alertMac = testDeviceMac || TEST_DEVICE_MAC;
@@ -1004,39 +1070,54 @@ async function runPhaseVitals() {
     'backend', [200, 400, 404]
   );
 
-  // POST /mobile/export-vitals (stub — not yet implemented)
-  // Body: { user_name, device_mac, start_timestamp, end_timestamp, format }
+  // POST /mobile/export-vitals
+  // Body: { user_name, device_mac, start_timestamp, end_timestamp, format: 'csv'|'json' }
   // Auth: backend
+  // Downloads vitals as CSV or JSON file.
   await runTest(
     'POST /mobile/export-vitals', '/mobile/export-vitals',
     { user_name: userName, device_mac: alertMac, start_timestamp: now - 86400, end_timestamp: now, format: 'csv' },
-    'backend', [200, 501]
+    'backend', [200, 400]
   );
 }
 
 // ------------------------------------------------------------------
-// PHASE 7: STUBS (not yet implemented — expect 501)
+// PHASE 7: NOTIFICATIONS
 // ------------------------------------------------------------------
-async function runPhaseStubs() {
-  logSection('Phase 7: Notification & Sleep Stubs');
+async function runPhaseNotifications() {
+  logSection('7. Notification Flow — Register Token → Get/Set Preferences → Unregister');
 
   // POST /mobile/notifications/register
-  // Body: { device_token }  Auth: mobile JWT
+  // Body: { device_token, device_info? }  Auth: mobile JWT
+  // Register an FCM push token for the current user.
   await runTest('POST /mobile/notifications/register', '/mobile/notifications/register',
-    { device_token: 'fake_fcm_token_123' }, 'mobile', [200, 501]);
+    { device_token: 'test_fcm_token_' + Date.now(), device_info: 'API Tester' }, 'mobile', [200]);
 
-  // POST /mobile/notifications/preferences
+  // POST /mobile/notifications/preferences (read)
   // Body: {}  Auth: mobile JWT
-  await runTest('POST /mobile/notifications/preferences', '/mobile/notifications/preferences',
-    {}, 'mobile', [200, 501]);
+  // Send empty body to read current preferences.
+  await runTest('POST /mobile/notifications/preferences (read)', '/mobile/notifications/preferences',
+    {}, 'mobile', [200]);
 
-  // POST /mobile/sleep/analysis
-  // Body: { user_name }  Auth: backend
+  // POST /mobile/notifications/preferences (update)
+  // Body: { push_enabled, email_enabled }  Auth: mobile JWT
+  await runTest('POST /mobile/notifications/preferences (update)', '/mobile/notifications/preferences',
+    { push_enabled: true, email_enabled: false }, 'mobile', [200]);
+
+  // POST /mobile/notifications/unregister
+  // Body: { device_token }  Auth: mobile JWT
+  await runTest('POST /mobile/notifications/unregister', '/mobile/notifications/unregister',
+    { device_token: 'test_fcm_token_nonexistent' }, 'mobile', [200]);
+}
+
+// ------------------------------------------------------------------
+// PHASE 7b: STUBS (not yet implemented — expect 501)
+// ------------------------------------------------------------------
+async function runPhaseStubs() {
+  logSection('8. Stubs (Not Yet Implemented — expect 501)');
+
   await runTest('POST /mobile/sleep/analysis', '/mobile/sleep/analysis',
     { user_name: userName }, 'backend', [200, 501]);
-
-  // POST /mobile/sleep/report
-  // Body: { user_name }  Auth: backend
   await runTest('POST /mobile/sleep/report', '/mobile/sleep/report',
     { user_name: userName }, 'backend', [200, 501]);
 }
@@ -1045,7 +1126,7 @@ async function runPhaseStubs() {
 // PHASE 8: CLEANUP — delete the test account
 // ------------------------------------------------------------------
 async function runPhaseCleanup() {
-  logSection('Phase 8: Cleanup');
+  logSection('9. Cleanup — Delete Test Account');
 
   // POST /mobile/user/delete-account
   // Body: {} (user identified by JWT)
@@ -1111,6 +1192,7 @@ async function runAllTests(skipSignup) {
   await runPhaseUsers();
   await runPhaseAlerts();
   await runPhaseVitals();
+  await runPhaseNotifications();
   await runPhaseStubs();
   await runPhaseCleanup();
 

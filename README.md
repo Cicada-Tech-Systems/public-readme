@@ -1,975 +1,1003 @@
 # HomeDots API Backend
 
-Healthcare IoT backend for BedDot sensor devices. Provides device management, vital signs data, user authentication, and mobile app APIs.
+Healthcare IoT backend for BedDot sensor devices. Provides device management, vital signs monitoring, user authentication, alert system, and mobile/web APIs.
+
+---
+
+## Migration Guide — What Changed
+
+If your app was built against the previous API, review the items below. Items marked **BREAKING** require code changes.
+
+### Breaking Changes
+
+| # | Change | Details | Action Required |
+|---|--------|---------|-----------------|
+| 1 | **Role renamed** | `co-owner` → `manager` | Replace all `"co-owner"` strings with `"manager"` in invite/role API calls |
+| 2 | **`/mobile/auth/verify-firebase-token` removed** | Firebase phone auth no longer supported | Use `/mobile/auth/google` or `/mobile/auth/apple` instead |
+| 3 | **`/mobile/invite-user` body changed** | `invitee_email` was required, now optional | No action if you always send it. New: response includes `invite_token` field |
+
+### Changed Endpoints (same path, different behavior)
+
+| Endpoint | Was (old) | Now (new) | Breaking? |
+|----------|-----------|-----------|-----------|
+| `POST /mobile/auth/signup` | 409 if email exists | 409 if verified email exists. Recycles unverified accounts with expired OTP | No |
+| `POST /mobile/add-device` | Required `device_name`, `group_id`. Device had to exist in DB (admin pre-registered). Error if already claimed. | `device_name` and `group_id` are optional. Auto-creates device record. Returns `{status: "device_already_claimed"}` instead of error. Accepts `claim_token`. | **Partial** — check for `status` field in response |
+| `POST /mobile/add-device` | Device auto-added to default group | Device starts ungrouped | No |
+| `POST /mobile/get-groups` | Returned `{data: {groups: [...]}}` | Returns `{data: {groups: [...], ungrouped_devices: [...]}}`. New `ungrouped_devices` array. | No — old `groups` key still works |
+| `POST /mobile/get-groups` | Response had `is_default` on groups | `is_default` removed (no default groups) | No — just ignore missing field |
+| `POST /mobile/get-groups` | Device fields: `id`, `name`, `mac_address` | Returns BOTH old (`id`, `name`, `mac_address`) AND new (`device_id`, `device_description`, `device_mac`) field names | No |
+| `POST /mobile/get-devices-with-alerts` | Response had `id`, `name`, `alertCount` | Returns BOTH old AND new field names (`device_id`, `device_description`, `alert_count`) | No |
+| `POST /mobile/get-alerts-by-device` | Response had `id`, `current`, `threshold`, `alertStatus` | Returns BOTH old AND new field names (`alert_id`, `current_value`, `threshold_value`, `alert_status`) plus new `status`, `severity`, `acknowledged_at` | No |
+| `POST /mobile/invite-user` | Required `invitee_email`. Returned `{invitation_id}` | `invitee_email` optional. Returns `{invitation_id, invite_token}`. Sends push notification | **Yes** — role must be `"manager"` not `"co-owner"` |
+| `POST /mobile/delete-group` | Moved devices to default group | Devices become ungrouped | No |
+| `POST /mobile/resolve-alert` | Any user with device access could resolve | Only owner, manager, caregiver can resolve. Viewers get 401. | **Partial** — viewers will now get errors |
+| `POST /mobile/respond-invitation` | No notification sent | Sends push notification to inviter | No |
+| `POST /mobile/get-vitals` | Returned ~2 data points per hour (full-range aggregation) | Returns ~240 data points per hour (auto-scaled). End timestamp clamped to server time. | No — more data, same format |
+| `POST /mobile/update-device-user-role` | Owner or co-owner could change roles | Only owner can change roles (managers cannot) | **Partial** — managers will now get 403 |
+| `POST /mobile/user/delete-account` | Was a stub (501) | Now works — soft-deletes account | No |
+| `POST /mobile/notifications/register` | Was a stub (501) | Now works — registers FCM token | No — was unused |
+| `POST /mobile/notifications/preferences` | Was a stub (501) | Now works — toggles push/email | No — was unused |
+| `POST /mobile/export-vitals` | Was a stub (501) | Now works — returns CSV or JSON file | No — was unused |
+
+### New Endpoints (not in previous version)
+
+| Endpoint | Purpose | When to adopt |
+|----------|---------|---------------|
+| `POST /mobile/auth/google` | Google Sign-In via JWKS | When adding Google Sign-In to app |
+| `POST /mobile/auth/apple` | Apple Sign-In via JWKS | When adding Apple Sign-In to app |
+| `POST /mobile/update-device` | Rename a device (owner/manager) | When adding device settings UI |
+| `POST /mobile/rename-group` | Rename a group | When adding group edit UI |
+| `POST /mobile/request-device-access` | Request view access to another user's device | When adding device sharing discovery |
+| `POST /mobile/acknowledge-alert` | Mark alert as "I'm handling it" (stops escalation) | When adding alert workflow |
+| `POST /mobile/accept-invite-link` | Accept a shareable invite token | When adding invite link deep links |
+| `POST /mobile/invite-user-to-group` | Invite user to ALL devices in a group | When adding group sharing |
+| `POST /mobile/get-latest-vitals` | Latest reading for all devices in one call | For dashboard home screen |
+| `POST /mobile/notifications/unregister` | Remove FCM token on logout | When implementing push |
+
+### Removed Endpoints
+
+| Old Endpoint | Replacement |
+|-------------|-------------|
+| `POST /mobile/auth/verify-firebase-token` | `POST /mobile/auth/google` or `POST /mobile/auth/apple` |
+
+### Unchanged Endpoints (no modifications needed)
+
+These endpoints work exactly as documented in the previous version:
+
+`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/remove-device-from-group`, `/mobile/pair-device`, `/mobile/get-dashboard-stats`, `/mobile/get-alert-thresholds`, `/mobile/update-alert-thresholds`, `/mobile/get-device-users`, `/mobile/get-invitations`, `/mobile/remove-device-user`
 
 ---
 
 ## Table of Contents
 
-- [Deployment](#deployment)
-  - [Build Docker Images](#build-docker-images)
-  - [Deploy with Docker Compose](#deploy-with-docker-compose)
-  - [Caddy Reverse Proxy](#caddy-reverse-proxy)
+- [Migration Guide](#migration-guide-v2-api-changes)
+- [Architecture](#architecture)
+- [Quick Start](#quick-start)
+- [Project Structure](#project-structure)
+- [Environment Variables](#environment-variables)
 - [API Reference](#api-reference)
-  - [Response Format](#response-format)
-  - [Authentication Types](#authentication-types)
-  - [Input Validation](#input-validation)
-  - [Mobile Auth API](#mobile-auth-api) (7 endpoints)
-  - [Mobile Devices API](#mobile-devices-api) (8 endpoints)
-  - [Mobile Alerts API](#mobile-alerts-api) (4 endpoints)
-  - [Mobile Users API](#mobile-users-api) (15 endpoints)
-  - [Mobile Vitals API](#mobile-vitals-api) (2 endpoints)
-  - [Legacy Device API](#legacy-device-api) (33 endpoints)
+  - [Authentication](#authentication)
+  - [Auth Endpoints](#auth-endpoints) (9 endpoints)
+  - [Profile Endpoints](#profile-endpoints) (5 endpoints)
+  - [Device Endpoints](#device-endpoints) (7 endpoints)
+  - [Group Endpoints](#group-endpoints) (6 endpoints)
+  - [Vitals Endpoints](#vitals-endpoints) (3 endpoints)
+  - [Alert Endpoints](#alert-endpoints) (6 endpoints)
+  - [Sharing & Permissions](#sharing--permissions) (8 endpoints)
+  - [Notifications](#notifications) (4 endpoints)
+  - [Admin Endpoints](#admin-endpoints)
+  - [Backend Server Endpoints](#backend-server-endpoints)
+- [Permission Roles](#permission-roles)
+- [Response Format](#response-format)
 - [Integration Notes](#integration-notes)
-- [Legacy Install (Non-Docker)](#legacy-install-non-docker)
-- [Machine Code Conversion](#machine-code-conversion)
+- [Deployment](#deployment)
+- [Testing](#testing)
 
 ---
 
-## Deployment
+## Architecture
 
-### Build Docker Images
+The backend runs in **dual mode** controlled by `IS_MASTER_SERVER`:
 
-```bash
-# Build all 3 images
-./build.sh
+- **Master** (`IS_MASTER_SERVER=1`): Connects directly to MySQL, InfluxDB, Grafana.
+- **Slave** (`IS_MASTER_SERVER=0`): Forwards API requests to the master server.
 
-# Build and save as tar files (for offline transfer)
-./build.sh --save
-```
+Three processes run in Docker via supervisord:
+1. **http_api** — Flask/Gunicorn serving REST APIs + web dashboard
+2. **socket_api** — Flask-SocketIO for WebSocket connections
+3. **forward_ga** — MQTT subscriber that writes sensor data to InfluxDB
 
-Images built:
-| Image | Description |
-|-------|-------------|
-| `dot_cloud:v2` | Backend application |
-| `dot_influx:wave` | InfluxDB with pre-configured databases and users |
-| `dot_grafana:wave` | Grafana with custom dashboards |
+---
 
-### Deploy with Docker Compose
+## Quick Start
 
 ```bash
-cd docker_image
-chmod +x run_dot.sh
-sudo ./run_dot.sh
+# Clone and install
+git clone <repo-url> && cd DotBackendLuo
+pip install -r requirements-dev.txt
+
+# Run tests (no external services needed)
+python -m pytest tests/ --ignore=v3 -v
+
+# Start server (requires .env with DB credentials)
+cd app/interface/http_api && python http_api_server_main.py
 ```
 
-This loads/pulls images, creates persistent directories at `/.dots/`, and starts 4 containers:
+---
 
-| Service | Container | Host Port | Internal Port |
-|---------|-----------|-----------|---------------|
-| Backend | dot_cloud | 4000 | 3425 |
-| InfluxDB | influx | 4001 | 8086 |
-| Grafana | grafana | 4002 | 3000 |
-| MariaDB | dot_mariadb | none (internal) | 3306 |
+## Project Structure
 
-All ports bind to `127.0.0.1` — only accessible via Caddy reverse proxy.
+```
+app/interface/
+├── http_api/           # API endpoints (Flask blueprints)
+│   ├── auth.py             Auth decorators (JWT, backend token)
+│   ├── validators.py       Input validation (@validate decorator)
+│   ├── mobile_auth_api.py
+│   ├── mobile_devices_api.py
+│   ├── mobile_alerts_api.py
+│   ├── mobile_users_api.py
+│   ├── mobile_vitals_api.py
+│   ├── admin_dashboard_api.py
+│   └── backend_*.py        Server-to-server endpoints
+├── models/             # SQLAlchemy ORM models
+├── services/           # Business logic (20+ services)
+├── tasks/              # Celery async tasks
+├── utils/              # Time, MAC, sanitization utilities
+├── config.py           # Configuration from env vars
+└── errors.py           # Error classes
 
-**First-time setup:**
+web/                    # React dashboard (Vite + Tailwind)
+v3/                     # Next-gen FastAPI rewrite
+tests/                  # 165 tests (pytest, SQLite in-memory)
+migrations/             # SQL migration scripts
+docker_image/           # Docker Compose + infrastructure
+```
 
-1. Edit MariaDB credentials: `sudo nano /.dots/backend/.env.mariadb`
-2. Update backend config in `/.dots/backend/.env`:
-   - `SQL_HOST=dot_mariadb`
-   - `INFLUXDB_IP=http://influx`
-3. Restart: `docker restart dot_cloud`
+---
 
-### Caddy Reverse Proxy
+## Environment Variables
 
-Install Caddy on the host and copy `docker_image/Caddyfile` to `/etc/caddy/Caddyfile`. Edit the domain name, then restart Caddy. Caddy handles TLS automatically via Let's Encrypt.
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `IS_MASTER_SERVER` | Yes | `0` | `1` = direct DB, `0` = slave mode |
+| `JWT_SECRET` | Yes | - | Secret for JWT signing |
+| `SQL_HOST` | Master | `localhost` | MySQL/MariaDB host |
+| `SQL_DATABASE` | Master | `beddot` | Database name |
+| `SQL_USER` | Master | - | Database username |
+| `SQL_PASSWORD` | Master | - | Database password |
+| `MASTER_SERVER_URL` | Slave | - | URL of master server |
+| `EMAIL_SERVICE_URL` | No | - | Nodemailer HTTP endpoint |
+| `FIREBASE_CREDENTIALS` | No | - | Firebase JSON (FCM push only) |
+| `APP_BASE_URL` | No | `https://api.homedots.us` | Base URL for deep links |
+| `GOOGLE_CLIENT_ID` | No | - | Google OAuth client ID |
+| `APPLE_CLIENT_ID` | No | - | Apple OAuth client ID (bundle ID) |
+| `SSL_VERIFY` | No | `true` | SSL verification for outbound requests |
+| `LOG_LEVEL` | No | `WARNING` | Python logging level |
+| `CORS_ORIGINS` | No | `https://homedots.us,...` | Allowed CORS origins |
 
 ---
 
 ## API Reference
 
-### Response Format
+### Authentication
 
-All endpoints return JSON. The shape depends on success or failure:
+Two auth types:
 
-**Success** (HTTP 200):
-```json
-{
-  "data": { ... },
-  "message": "Human-readable status"
-}
-```
+| Type | Header | Used by |
+|------|--------|---------|
+| **JWT (Mobile)** | `Authorization: Bearer <jwt>` | Profile, notifications endpoints |
+| **Backend Auth** | `Authorization: Bearer <backend_token>` + `user_name` in body | Device, vitals, alert, sharing endpoints |
 
-**Error** (HTTP 4xx/5xx):
-```json
-{
-  "message": "What went wrong"
-}
-```
-
-Common error codes: `400` (bad request / validation), `401` (unauthorized / expired token), `403` (forbidden), `404` (not found), `409` (conflict / duplicate), `500` (server error).
-
----
-
-### Authentication Types
-
-| Type | Header | Used by | Description |
-|------|--------|---------|-------------|
-| JWT (Mobile) | `Authorization: Bearer <jwt_token>` | Profile endpoints | For mobile app users. Obtained via `/mobile/auth/login` or `/mobile/auth/verify-otp`. Expires in 1 hour. |
-| Backend Auth | `Authorization: Bearer <backend_token>` | Device, alert, user-mgmt, vitals endpoints | Requires `user_name` in JSON body. Token is from the `user_conf` table. |
-
-> JWT payload contains: `mobile_user_id`, `email`, `user_id`, `exp`. Profile endpoints use the `email` from the JWT automatically -- no need to send it in the body.
-
----
+JWT tokens are obtained via `/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/google`, or `/mobile/auth/apple`. They expire in 1 hour. Use `/mobile/auth/refresh-token` to get a new one.
 
 ### Input Validation
 
-The following rules are enforced server-side on all endpoints that accept these fields:
-
 | Field | Rule |
 |-------|------|
-| `email` | Must be a valid email format. Automatically lowercased and trimmed. |
-| `password` | Minimum 8 characters. |
-| `device_mac` | Must match `XX:XX:XX:XX:XX:XX` format (hex, colon or dash separated). |
-| `role` / `new_role` | Must be one of: `co-owner`, `viewer`, `caregiver`. |
-| `status` | Must be one of: `not_verified`, `verified`, `profile_completed`, `tutorial_completed`. |
-| `otp_type` | Must be `signup` or `recovery`. |
-| `limit` | Clamped to 1-200. Defaults to 50. |
-| `offset` | Clamped to >= 0. Defaults to 0. |
+| `email` | Valid format, auto-lowercased |
+| `password` | Min 8 characters |
+| `device_mac` | `XX:XX:XX:XX:XX:XX` format |
+| `role` / `new_role` | `manager`, `viewer`, or `caregiver` |
+| `otp_code` | Exactly 6 digits |
+| `limit` | 1-200 (default 50) |
+| `offset` | >= 0 (default 0) |
 
 ---
 
-### Mobile Auth API
+### Auth Endpoints
 
-All endpoints under `/mobile/auth/`. No authentication required (public). Rate-limited per IP.
+All `POST` to `/mobile/auth/*`. No authentication required. Rate-limited.
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/auth/signup</b></code> <code>Register a new user account</code></summary>
+<summary><b>POST /mobile/auth/signup</b> — Register a new account</summary>
 
-Rate limit: 5/min
+**Body:** `{email: string, password: string}` (password min 8 chars)
 
-##### Body Parameters
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `201` | `{data: {mobile_user_id: 1}, message: "OTP sent"}` |
+| Email already registered | `409` | `{message: "Email already registered"}` |
+| Invalid email format | `400` | `{message: "Invalid email format"}` |
+| Password too short | `400` | `{message: "Password must be at least 8 characters"}` |
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `email` | required | string | User email address |
-> | `password` | required | string | Min 8 characters |
-
-##### Success Response (200)
-
-```json
-{
-  "data": { "mobile_user_id": 1 },
-  "message": "OTP sent"
-}
-```
-
-> An OTP (6-digit code, type `signup`) is generated and must be verified before the user can log in.
-
-##### Error Responses
-
-> | http code | message |
-> |-----------|---------|
-> | `400` | Invalid email format / Password too short |
-> | `409` | Email already registered |
-
+If the email was previously registered but never verified (OTP expired), the account is recycled with a new password and fresh OTP.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/auth/login</b></code> <code>Login and receive JWT tokens</code></summary>
+<summary><b>POST /mobile/auth/login</b> — Login with email and password</summary>
 
-Rate limit: 10/min
+**Body:** `{email: string, password: string}`
 
-##### Body Parameters
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {access_token, refresh_token, user: {mobile_user_id, email, name, status}}, message: "Login successful"}` |
+| Wrong credentials | `401` | `{message: "Invalid email or password"}` |
+| Account not verified | `401` | `{message: "Invalid email or password"}` |
+| Account doesn't exist | `401` | `{message: "Invalid email or password"}` |
+| OAuth-only account (no password) | `401` | `{message: "Invalid email or password"}` |
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `email` | required | string | User email address |
-> | `password` | required | string | User password |
-
-##### Success Response (200)
-
-```json
-{
-  "data": {
-    "access_token": "eyJ...",
-    "refresh_token": "a1b2c3...",
-    "user": {
-      "mobile_user_id": 1,
-      "email": "user@example.com",
-      "name": "John",
-      "status": "profile_completed"
-    }
-  },
-  "message": "Login successful"
-}
-```
-
-##### Error Responses
-
-> | http code | message |
-> |-----------|---------|
-> | `401` | Invalid email or password |
-> | `400` | Email not verified. Please verify your OTP first. |
-
+Note: All auth failures return the same message to prevent user enumeration.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/auth/verify-otp</b></code> <code>Verify OTP code sent to email</code></summary>
+<summary><b>POST /mobile/auth/verify-otp</b> — Verify OTP code</summary>
 
-Rate limit: 5/min. Locked out after 5 failed attempts (15-minute cooldown).
+**Body:** `{email: string, otp_code: string (6 digits), otp_type: "signup" | "recovery"}`
 
-##### Body Parameters
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {access_token, refresh_token, user: {...}}, message: "Verified"}` |
+| Wrong OTP | `400` | `{message: "Invalid or expired OTP"}` |
+| OTP expired | `400` | `{message: "Invalid or expired OTP"}` |
+| Wrong otp_type | `400` | `{message: "Invalid or expired OTP"}` |
+| Too many attempts | `400` | `{message: "Too many failed attempts. Try again later."}` |
+| User not found | `404` | `{message: "User not found"}` |
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `email` | required | string | User email address |
-> | `otp_code` | required | string | 6-digit OTP from email |
-> | `otp_type` | required | string | `signup` or `recovery` |
-
-##### Success Response (200)
-
-```json
-{
-  "data": {
-    "access_token": "eyJ...",
-    "refresh_token": "a1b2c3...",
-    "user": {
-      "mobile_user_id": 1,
-      "email": "user@example.com",
-      "name": null,
-      "status": "verified"
-    }
-  },
-  "message": "Verified"
-}
-```
-
-> When `otp_type` is `signup`, user status changes from `not_verified` to `verified`.
-> When `otp_type` is `recovery`, a one-time flag is set that permits `/mobile/auth/update-password`.
-
-##### Error Responses
-
-> | http code | message |
-> |-----------|---------|
-> | `400` | Invalid or expired OTP |
-> | `400` | Too many failed attempts. Try again later. |
-> | `404` | User not found |
-
+Locked out after 5 failed attempts for 15 minutes. `signup` type sets status to `verified`. `recovery` type enables password update for 15 minutes.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/auth/resend-otp</b></code> <code>Resend OTP code</code></summary>
+<summary><b>POST /mobile/auth/resend-otp</b> — Resend OTP code</summary>
 
-Rate limit: 3/min
+**Body:** `{email: string, otp_type: "signup" | "recovery"}`
 
-##### Body Parameters
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "OTP resent"}` |
+| Email not found | `200` | `{message: "OTP resent"}` |
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `email` | required | string | User email address |
-> | `otp_type` | required | string | `signup` or `recovery` |
-
-##### Success Response (200)
-
-```json
-{ "message": "OTP resent" }
-```
-
-> Always returns 200 even if email is not registered (prevents user enumeration). Resets any OTP lockout.
-
+Always returns 200 to prevent user enumeration. Resets any OTP lockout.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/auth/reset-password</b></code> <code>Request password reset (sends recovery OTP)</code></summary>
+<summary><b>POST /mobile/auth/reset-password</b> — Request password reset</summary>
 
-Rate limit: 3/min
+**Body:** `{email: string}`
 
-##### Body Parameters
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Recovery OTP sent"}` |
+| Email not found | `200` | `{message: "Recovery OTP sent"}` |
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `email` | required | string | User email address |
-
-##### Success Response (200)
-
-```json
-{ "message": "Recovery OTP sent" }
-```
-
-> Always returns 200 even if email is not registered (prevents user enumeration). Sends a `recovery`-type OTP.
-
+Always returns 200. Sends a `recovery`-type OTP to the email.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/auth/update-password</b></code> <code>Set new password after OTP verification</code></summary>
+<summary><b>POST /mobile/auth/update-password</b> — Set new password (requires JWT)</summary>
 
-Rate limit: 5/min
+**Body:** `{password: string}` (min 8 chars)
 
-> **Prerequisite:** Must call `/mobile/auth/verify-otp` with `otp_type: "recovery"` first. The password update is only allowed once per recovery OTP verification.
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Password updated"}` |
+| OTP not verified | `403` | `{message: "OTP verification required before password update"}` |
+| OTP verification expired (>15 min) | `403` | `{message: "OTP verification required before password update"}` |
+| User not found | `404` | `{message: "User not found"}` |
 
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `email` | required | string | User email address |
-> | `password` | required | string | New password (min 8 characters) |
-
-##### Success Response (200)
-
-```json
-{ "message": "Password updated" }
-```
-
-> After a password change, the user's refresh token is invalidated. They must log in again.
-
-##### Error Responses
-
-> | http code | message |
-> |-----------|---------|
-> | `403` | OTP verification required before password update |
-> | `404` | User not found |
-
+Must call `verify-otp` with `otp_type: "recovery"` first. Password update window expires after 15 minutes.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/auth/refresh-token</b></code> <code>Refresh JWT access token</code></summary>
+<summary><b>POST /mobile/auth/refresh-token</b> — Refresh JWT access token</summary>
 
-Rate limit: 10/min
+**Body:** `{mobile_user_id: int, refresh_token: string}`
 
-##### Body Parameters
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {access_token, refresh_token}}` |
+| Invalid token | `401` | `{message: "Invalid refresh token"}` |
+| Expired token | `401` | `{message: "Invalid refresh token"}` |
+| Already rotated | `401` | `{message: "Invalid refresh token"}` |
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `mobile_user_id` | required | int | The user's mobile_user_id |
-> | `refresh_token` | required | string | Current refresh token |
+Old refresh token is invalidated on success (rotation). Store the new `refresh_token`.
+</details>
 
-##### Success Response (200)
+<details>
+<summary><b>POST /mobile/auth/google</b> — Sign in with Google</summary>
 
-```json
-{
-  "data": {
-    "access_token": "eyJ...",
-    "refresh_token": "new_token..."
-  }
-}
-```
+**Body:** `{id_token: string}` (Google ID token from Google SDK)
 
-> The old refresh token is invalidated and a new one is returned (token rotation). Store the new `refresh_token` for the next refresh.
+| Response | Status | Body |
+|----------|--------|------|
+| Success (existing user) | `200` | `{data: {access_token, refresh_token, user: {...}}, message: "Authenticated via Google"}` |
+| Success (new account) | `200` | Same format. Account auto-created with `status: "verified"`. |
+| Invalid token | `401` | `{message: "Invalid Google token"}` |
+| Token expired | `401` | `{message: "Google token expired"}` |
+| Email not verified | `401` | `{message: "Google email is not verified"}` |
+</details>
 
-##### Error Responses
+<details>
+<summary><b>POST /mobile/auth/apple</b> — Sign in with Apple</summary>
 
-> | http code | message |
-> |-----------|---------|
-> | `401` | Invalid refresh token (wrong, expired, or already rotated) |
+**Body:** `{id_token: string, email?: string, name?: string}`
 
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {access_token, refresh_token, user: {...}}, message: "Authenticated via Apple"}` |
+| No email available | `400` | `{message: "Email is required. Apple may not include it after first login."}` |
+| Invalid token | `401` | `{message: "Invalid Apple token"}` |
+
+Apple only sends `email` on first authorization. After that, the client must cache and send it in the request body.
+</details>
+
+**Password reset flow:** `reset-password` → `verify-otp` (recovery) → `update-password`
+
+---
+
+### Profile Endpoints
+
+All `POST` to `/mobile/user/*`. Require **JWT auth**.
+
+<details>
+<summary><b>POST /mobile/user/get-profile</b> — Get current user's profile</summary>
+
+**Body:** _(none — user identified by JWT)_
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {id, email, name, age, gender, sleep_goals, wake_time, sleep_time, status, is_admin}}` |
+| User not found | `404` | `{message: "User not found"}` |
+| Missing/expired JWT | `401` | `{message: "Bearer token is missing"}` or `{message: "Token has expired"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/user/complete-profile</b> — Complete profile after signup</summary>
+
+**Body:** `{name, age, gender, sleep_goals, wake_time, sleep_time}` (all required)
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Profile completed"}` |
+| Wrong status | `400` | `{message: "Cannot complete profile in current status 'not_verified'"}` |
+| Missing fields | `400` | `{message: "Missing keys: name, age"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/user/update-profile</b> — Update profile fields</summary>
+
+**Body:** `{name?, age?, gender?, sleep_goals?, wake_time?, sleep_time?}` (send only fields to change)
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Profile updated"}` |
+
+Only allowlisted fields are accepted. Any `email`, `password`, `status` fields in the body are silently ignored.
+</details>
+
+<details>
+<summary><b>POST /mobile/user/update-status</b> — Update user status</summary>
+
+**Body:** `{status: "not_verified" | "verified" | "profile_completed" | "tutorial_completed"}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Status updated"}` |
+| Invalid status | `400` | `{message: "Invalid status. Must be one of: ..."}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/user/delete-account</b> — Delete account</summary>
+
+**Body:** _(none)_
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Account deleted"}` |
+
+Soft-deletes the account. User data is retained but inaccessible. Releases all owned devices.
 </details>
 
 ---
 
-### Mobile Devices API
+### Device Endpoints
 
-All endpoints require **backend authentication** (`Authorization: Bearer <backend_token>`) and `user_name` in the JSON body.
+Require **backend auth** (`Authorization: Bearer <token>`) + `user_name` in body.
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/get-groups</b></code> <code>Get all device groups for the user</code></summary>
+<summary><b>POST /mobile/add-device</b> — Claim a device by MAC address</summary>
 
-##### Body Parameters
+**Body:** `{user_name, device_mac, device_name?, claim_token?, group_id?}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username (from user_conf) |
+| Response | Status | Body |
+|----------|--------|------|
+| Claimed successfully | `201` | `{data: {status: "claimed", device_id: 42}}` |
+| Already claimed by another user | `200` | `{data: {status: "device_already_claimed", device_id: 42, message: "This device is registered to another user. You can request view access from the owner."}}` |
+| Wrong claim token | `400` | `{message: "Invalid claim token. Check the code on your device label."}` |
+| Invalid MAC format | `400` | `{message: "Invalid MAC address format (expected XX:XX:XX:XX:XX:XX)"}` |
+| User not found | `404` | `{message: "User not found"}` |
 
-##### Success Response (200)
-
-```json
-{
-  "data": {
-    "groups": [
-      {
-        "id": 1,
-        "name": "Bedroom",
-        "device_count": 2,
-        "devices": [
-          {
-            "id": 10,
-            "name": "Mom's BedDot",
-            "mac_address": "AA:BB:CC:DD:EE:01",
-            "activity_status": "active",
-            "occupied_status": "occupied",
-            "role": "owner"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
+If the device doesn't exist in the database, it's auto-created. `claim_token` is optional for testing but should be enforced in production. If device is already claimed, use `/mobile/request-device-access` to request view permissions.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/create-group</b></code> <code>Create a new device group</code></summary>
+<summary><b>POST /mobile/pair-device</b> — Pair a device using a pairing code</summary>
 
-##### Body Parameters
+**Body:** `{user_name, pairing_code, device_name}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `group_name` | required | string | Name for the new group |
-
-##### Success Response (200)
-
-```json
-{
-  "data": { "group_id": 5 },
-  "message": "Group created"
-}
-```
-
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `201` | `{data: {device_id, device_mac}, message: "Device paired"}` |
+| Invalid code | `404` | `{message: "Invalid or expired pairing code"}` |
+| Already claimed | `400` | `{message: "Device is already claimed by another user"}` |
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/add-device-to-group</b></code> <code>Add a device to a group</code></summary>
+<summary><b>POST /mobile/update-device</b> — Rename a device</summary>
 
-##### Body Parameters
+**Body:** `{user_name, device_mac, device_name?}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `group_id` | required | int | Target group ID |
-> | `device_id` | required | int | Device ID to add |
-
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {device_id, device_mac, device_description}, message: "Device updated"}` |
+| No access | `400` | `{message: "Only device owners and managers can edit device settings"}` |
+| Device not found | `404` | `{message: "Device not found"}` |
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/remove-device-from-group</b></code> <code>Remove a device from a group</code></summary>
+<summary><b>POST /mobile/request-device-access</b> — Request view access to someone else's device</summary>
 
-##### Body Parameters
+**Body:** `{user_name, device_mac, note?}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `group_id` | required | int | Group ID |
-> | `device_id` | required | int | Device ID to remove |
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {invitation_id: 15}, message: "Access request sent to device owner"}` |
+| Already have access | `400` | `{message: "You already have access to this device"}` |
+| Own device | `400` | `{message: "You already own this device"}` |
+| No owner | `400` | `{message: "Device has no owner to request access from"}` |
+| Already pending | `400` | `{message: "Access request already pending for this device"}` |
 
+Creates an invitation with `is_access_request=true` visible in the owner's pending invitations. Owner can accept or decline.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/delete-group</b></code> <code>Delete a device group</code></summary>
+<summary><b>POST /mobile/get-groups</b> — List all groups and ungrouped devices</summary>
 
-##### Body Parameters
+**Body:** `{user_name}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `group_id` | required | int | Group ID to delete |
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {groups: [{group_id, group_name, device_count, devices: [{device_id, device_description, device_mac, last_seen_raw, activity_status, role}]}], ungrouped_devices: [...]}}` |
 
+Devices not in any group appear in `ungrouped_devices`. Each device includes both old field names (`id`, `name`, `mac_address`) and new field names (`device_id`, `device_description`, `device_mac`) for backward compatibility.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/pair-device</b></code> <code>Pair a device using a pairing code</code></summary>
+<summary><b>POST /mobile/get-latest-vitals</b> — Latest vitals for all devices</summary>
 
-##### Body Parameters
+**Body:** `{user_name}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `pairing_code` | required | string | Code displayed on device |
-> | `device_name` | required | string | Friendly name for the device |
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {vitals: {"AA:BB:CC:DD:EE:FF": {time, heartrate, respiratoryrate, systolic, diastolic, movement, quality}, ...}}}` |
+| No devices | `200` | `{data: {vitals: {}}}` |
 
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/add-device</b></code> <code>Manually add a device by MAC address</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `device_mac` | required | string | Device MAC address (`XX:XX:XX:XX:XX:XX`) |
-> | `device_name` | required | string | Friendly name for the device |
-> | `group_id` | required | int | Group to place device in |
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/get-dashboard-stats</b></code> <code>Get dashboard statistics for the user</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-
-Returns device counts and summary data.
-
+Single InfluxDB query using `LAST()` aggregate. Safe to poll every 2-3 seconds.
 </details>
 
 ---
 
-### Mobile Alerts API
+### Group Endpoints
 
-All endpoints require **backend authentication** (`Authorization: Bearer <backend_token>`) and `user_name` in the JSON body.
+Require **backend auth** + `user_name` in body.
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/get-devices-with-alerts</b></code> <code>Get all devices with alert info</code></summary>
+<summary><b>POST /mobile/create-group</b> — Create a device group</summary>
 
-##### Body Parameters
+**Body:** `{user_name, group_name}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-
-##### Success Response (200)
-
-```json
-{
-  "data": {
-    "devices": [
-      {
-        "id": 10,
-        "created_at": "2025-01-15 10:30:00",
-        "updated_at": "2025-06-01 08:00:00",
-        "name": "Mom's BedDot",
-        "heart_rate": null,
-        "respiration_rate": null,
-        "systolic": null,
-        "diastolic": null,
-        "role": "owner",
-        "alertCount": 3
-      }
-    ]
-  }
-}
-```
-
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `201` | `{data: {group_id: 5}, message: "Group created"}` |
+| Name empty | `400` | `{message: "group_name cannot be empty"}` |
+| Name too long | `400` | `{message: "group_name too long (max 255 characters)"}` |
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/get-alerts-by-device</b></code> <code>Get paginated alerts for a device</code></summary>
+<summary><b>POST /mobile/rename-group</b> — Rename a group</summary>
 
-##### Body Parameters
+**Body:** `{user_name, group_id, group_name}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `device_mac` | required | string | Device MAC address (`XX:XX:XX:XX:XX:XX`) |
-> | `limit` | optional | int | Number of alerts (1-200, default 50) |
-> | `offset` | optional | int | Pagination offset (default 0) |
-
-##### Success Response (200)
-
-```json
-{
-  "data": {
-    "alerts": [
-      {
-        "id": 42,
-        "created_at": "2025-06-01 02:30:00",
-        "updated_at": "2025-06-01 02:30:00",
-        "title": "High Heart Rate",
-        "current": 110,
-        "threshold": 100,
-        "unit": "bpm",
-        "alertStatus": "active",
-        "issueTime": "2025-06-01 02:28:00"
-      }
-    ]
-  }
-}
-```
-
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Group renamed"}` |
+| Not found | `404` | `{message: "Group not found"}` |
+| Not owner | `404` | `{message: "Group not found"}` |
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/get-alert-thresholds</b></code> <code>Get alert threshold settings for a device</code></summary>
+<summary><b>POST /mobile/delete-group</b> — Delete a group</summary>
 
-##### Body Parameters
+**Body:** `{user_name, group_id}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `device_mac` | required | string | Device MAC address |
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Group deleted"}` |
+| Not found | `404` | `{message: "Group not found"}` |
 
+Devices in the group become ungrouped (not deleted).
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/update-alert-thresholds</b></code> <code>Update alert thresholds for a device</code></summary>
+<summary><b>POST /mobile/add-device-to-group</b> — Add a device to a group</summary>
 
-##### Body Parameters
+**Body:** `{user_name, group_id, device_id}`
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `device_mac` | required | string | Device MAC address |
-> | `thresholds` | required | object | Threshold values for vital signs |
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Device added to group"}` |
+| Not your group | `400` | `{message: "Group not found or not owned by user"}` |
+| No device access | `400` | `{message: "No access to this device"}` |
+</details>
 
+<details>
+<summary><b>POST /mobile/remove-device-from-group</b> — Remove a device from a group</summary>
+
+**Body:** `{user_name, group_id, device_id}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Device removed from group"}` |
+| Not your group | `400` | `{message: "Group not found or not owned by user"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/invite-user-to-group</b> — Invite a user to all devices in a group</summary>
+
+**Body:** `{user_name, group_id, invitee_email?, role}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {invited_count: 3, errors: []}, message: "Invited to 3 device(s)"}` |
+| No devices | `400` | `{message: "Group has no devices"}` |
+| Group not found | `404` | `{message: "Group not found"}` |
+
+Errors for individual devices are returned in `errors` array (e.g. "already invited"). Successfully invited devices are not rolled back.
 </details>
 
 ---
 
-### Mobile Users API
+### Vitals Endpoints
 
-#### Profile Endpoints
-
-Require **JWT authentication** (`Authorization: Bearer <jwt_token>`). The user's email is read from the JWT -- do not send `email` in the body.
+Require **backend auth** + `user_name` in body.
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/user/get-profile</b></code> <code>Get user profile data</code></summary>
+<summary><b>POST /mobile/get-vitals</b> — Query vital signs time series</summary>
 
-No body parameters required. User is identified by JWT.
+**Body:** `{user_name, device_mac, start_timestamp: int, end_timestamp: int}`
 
-##### Success Response (200)
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {vitals: [{time, heartrate, respiratoryrate, systolic, diastolic, movement, quality}, ...]}}` |
+| No InfluxDB config | `400` | `{message: "Influx configuration not found for this device"}` |
+| No data | `400` | `{message: "Data not found"}` |
+| No access | `401` | `{message: "Unauthorized"}` |
 
-```json
-{
-  "data": {
-    "id": 1,
-    "email": "user@example.com",
-    "name": "John Doe",
-    "age": "35-44",
-    "gender": "male",
-    "sleep_goals": "Improve deep sleep",
-    "wake_time": "07:00",
-    "sleep_time": "22:00",
-    "status": "profile_completed"
-  }
-}
-```
+Timestamps are UNIX epoch (seconds). `end_timestamp` is clamped to server's current time. Auto-scales aggregation interval: 1h→15s, 24h→5min, 7d→30min, 30d→2h.
 
+Available measurements: `heartrate`, `respiratoryrate`, `systolic`, `diastolic`, `movement`, `quality`.
 </details>
 
 <details>
-<summary><code>POST</code> <code><b>/mobile/user/complete-profile</b></code> <code>Complete user profile after signup</code></summary>
+<summary><b>POST /mobile/export-vitals</b> — Export vitals as file download</summary>
 
-> Sets status to `profile_completed` automatically.
+**Body:** `{user_name, device_mac, start_timestamp, end_timestamp, format?: "csv" | "json"}`
 
-##### Body Parameters
+| Response | Status | Body |
+|----------|--------|------|
+| Success (CSV) | `200` | File download with `Content-Type: text/csv` |
+| Success (JSON) | `200` | File download with `Content-Type: application/json` |
+| No data | `200` | Empty CSV (headers only) or `{vitals: []}` |
 
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `name` | required | string | Full display name |
-> | `age` | required | string | Age range (e.g. `"35-44"`) |
-> | `gender` | required | string | Gender |
-> | `sleep_goals` | required | string | Sleep goals description |
-> | `wake_time` | required | string | Wake time (`HH:MM` format) |
-> | `sleep_time` | required | string | Sleep time (`HH:MM` format) |
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/user/update-profile</b></code> <code>Update profile fields</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `name` | optional | string | Full display name |
-> | `age` | optional | string | Age range |
-> | `gender` | optional | string | Gender |
-> | `sleep_goals` | optional | string | Sleep goals description |
-> | `wake_time` | optional | string | Wake time (`HH:MM`) |
-> | `sleep_time` | optional | string | Sleep time (`HH:MM`) |
-
-> Only send the fields you want to change. Any `email` field in the body is ignored.
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/user/update-status</b></code> <code>Update user status</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `status` | required | string | One of: `not_verified`, `verified`, `profile_completed`, `tutorial_completed` |
-
-</details>
-
-#### Device User Management
-
-Require **backend authentication** (`Authorization: Bearer <backend_token>`) and `user_name` in the JSON body. Only device owners and co-owners can invite, remove, or change roles.
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/get-device-users</b></code> <code>Get all users with access to a device</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `device_id` | required | int | Device ID |
-
-##### Success Response (200)
-
-```json
-{
-  "data": {
-    "users": [
-      { "id": 1, "name": "owner_user", "role": "owner", "status": "Active" },
-      { "id": null, "name": "invited@example.com", "role": "viewer", "status": "Pending" }
-    ]
-  }
-}
-```
-
-> Returns both active role holders and pending invitations for the device.
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/invite-user</b></code> <code>Invite a user to share device access</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username (must be owner or co-owner) |
-> | `device_id` | required | int | Device ID |
-> | `invitee_email` | required | string | Email of user to invite |
-> | `role` | required | string | `co-owner`, `viewer`, or `caregiver` |
-
-##### Success Response (200)
-
-```json
-{
-  "data": { "invitation_id": 12 },
-  "message": "Invitation sent"
-}
-```
-
-##### Error Responses
-
-> | http code | message |
-> |-----------|---------|
-> | `403` | Only device owners/co-owners can invite users |
-> | `400` | Invitation already pending for this user and device |
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/get-invitations</b></code> <code>Get invitations for current user</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-
-##### Success Response (200)
-
-```json
-{
-  "data": {
-    "invitations": [
-      {
-        "id": 12,
-        "invited_by": "owner_user",
-        "device": "Mom's BedDot",
-        "role": "viewer",
-        "status": "Pending",
-        "invited_at": "2025-06-01 10:00:00"
-      }
-    ]
-  }
-}
-```
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/respond-invitation</b></code> <code>Accept or decline an invitation</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username (must be the invitation recipient) |
-> | `invitation_id` | required | int | Invitation ID |
-> | `accept` | required | boolean | `true` to accept, `false` to decline |
-
-> The server verifies the responder is the intended recipient (by matching `user_name` to the invitee's email via their linked mobile account). Accepting creates a role on the device; declining marks the invitation as declined.
-
-##### Error Responses
-
-> | http code | message |
-> |-----------|---------|
-> | `403` | This invitation is not for you |
-> | `404` | Invitation not found or already resolved |
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/remove-device-user</b></code> <code>Remove a user's access to a device</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username (must be owner or co-owner) |
-> | `device_id` | required | int | Device ID |
-> | `target_user_id` | required | int | User ID to remove |
-
-> Cannot remove yourself. Cannot remove the device owner.
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/update-device-user-role</b></code> <code>Change a user's role on a device</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username (must be owner or co-owner) |
-> | `device_id` | required | int | Device ID |
-> | `target_user_id` | required | int | Target user ID |
-> | `new_role` | required | string | `co-owner`, `viewer`, or `caregiver` |
-
-> Cannot change the owner's role.
-
-</details>
-
-#### Future Endpoints (return 501)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/mobile/user/delete-account` | Delete user account |
-| POST | `/mobile/notifications/register` | Register push notification token |
-| POST | `/mobile/notifications/preferences` | Set notification preferences |
-| POST | `/mobile/sleep/analysis` | Sleep data analysis |
-| POST | `/mobile/sleep/report` | Generate sleep report |
-
----
-
-### Mobile Vitals API
-
-Require **backend authentication** (`Authorization: Bearer <backend_token>`) and `user_name` in the JSON body.
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/get-vitals</b></code> <code>Get vital signs data for a device</code></summary>
-
-##### Body Parameters
-
-> | name | type | data type | description |
-> |------|------|-----------|-------------|
-> | `user_name` | required | string | Username |
-> | `device_mac` | required | string | Device MAC address (`XX:XX:XX:XX:XX:XX`) |
-> | `start_timestamp` | required | integer | Start of range (UNIX epoch) |
-> | `end_timestamp` | required | integer | End of range (UNIX epoch) |
-
-</details>
-
-<details>
-<summary><code>POST</code> <code><b>/mobile/export-vitals</b></code> <code>Export vital signs data (returns 501)</code></summary>
+Default format is `csv`. Response includes `Content-Disposition: attachment` header.
 </details>
 
 ---
 
-### Legacy Device API
+### Alert Endpoints
 
-These endpoints are from the original backend (`/http_api.py`). They use backend token authentication via the `Authorization` header.
+Require **backend auth** + `user_name` in body.
 
-#### Device Endpoints
+<details>
+<summary><b>POST /mobile/get-devices-with-alerts</b> — List devices with alert info</summary>
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/checkStatus2` | None | Get InfluxDB credentials for a device by MAC |
-| POST | `/auth-device` | None | Authenticate device by MAC and token |
-| POST | `/auth-user` | None | Authenticate user by name and token |
-| POST | `/auth-forward` | None | Authenticate forward server |
-| POST | `/auth-ai` | None | Authenticate AI server |
-| POST | `/auth-admin` | None | Authenticate admin |
+**Body:** `{user_name}`
 
-#### Vitals & Data
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {devices: [{device_id, device_mac, device_description, alert_count, role, ...}]}}` |
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/read-vitals-by-device-and-time` | User | Query vitals by device and time range |
-| POST | `/read-device-list-by-user` | User | Get devices for a user |
-| POST | `/read-device-list-by-ai` | AI | Get devices for AI server |
-| POST | `/read-alert-list-by-ai` | AI | Get alerts for AI server |
-| POST | `/read-device-list-by-forward` | Forward | Get devices for forward server |
+Each device includes both old field names (`id`, `name`, `alertCount`) and new names (`device_id`, `device_description`, `alert_count`).
+</details>
 
-#### Device Configuration
+<details>
+<summary><b>POST /mobile/get-alerts-by-device</b> — Paginated alert history</summary>
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/get-device-config-by-mac` | User | Get device config by MAC |
-| POST | `/update-device-config-by-mac` | User | Update device config |
-| POST | `/insert-device-config-by-mac` | User | Insert new device config |
-| POST | `/read-influx-conf-by-forward` | Forward | Get InfluxDB config for forwarder |
-| POST | `/read-mqtt-conf-by-forward` | Forward | Get MQTT config for forwarder |
-| POST | `/read-mqtt-conf-by-ai` | AI | Get MQTT config for AI |
-| POST | `/read-influx-conf-by-device` | Device | Get InfluxDB config for device |
-| POST | `/read-tboard-conf-by-device` | Device | Get ThingsBoard config for device |
+**Body:** `{user_name, device_mac, limit?: int, offset?: int}`
 
-#### Device Management
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {alerts: [{alert_id, title, current_value, threshold_value, unit, alert_status, status, severity, resolved_at, acknowledged_at, created_at}, ...]}}` |
+| No access | `401` | `{message: "No access to this device"}` |
+| Device not found | `404` | `{message: "Device not found"}` |
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/register-license-by-device` | User | Register device licenses |
-| POST | `/register-devices` | Admin | Bulk register devices |
-| POST | `/activate-device-registration` | Admin | Launch background registration |
-| POST | `/write-last-seen-by-device` | Forward | Record device last-seen timestamp |
-| POST | `/set-beddot` | Admin | Configure BedDot device |
-| POST | `/get-device-table` | User | Get device table data |
-| POST | `/set-device-table` | User | Update device table |
+`alert_status` is the legacy field (`"High"`, `"Medium"`, `"Low"`). `status` is the new lifecycle field (`"triggered"`, `"acknowledged"`, `"resolved"`). `severity` is the new severity (`"critical"`, `"warning"`, `"info"`).
+</details>
 
-#### Organization & Grafana
+<details>
+<summary><b>POST /mobile/get-alert-thresholds</b> — Get alert threshold settings</summary>
 
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/get-my-organization-name` | User | Get user's organization |
-| POST | `/get-organization-table` | Admin | Get all organizations |
-| POST | `/update-organization` | Admin | Update organization |
-| POST | `/add-organization` | Admin | Create organization |
-| POST | `/get-grafana-info-by-org` | Admin | Get Grafana info for org |
-| POST | `/get-grafana_info-by-fullname` | Admin | Get Grafana user info |
-| POST | `/refresh-grafana-dashboards` | User | Refresh Grafana dashboards |
+**Body:** `{user_name, device_mac}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {thresholds: {heartrate: {min: 50, max: 120}, respiratoryrate: {min: 8, max: 25}, ...}}}` |
+| No thresholds set | `200` | `{data: {thresholds: {}}}` |
+| No access | `404` | `{message: "Device not found or no access"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/update-alert-thresholds</b> — Set alert thresholds</summary>
+
+**Body:** `{user_name, device_mac, thresholds: {heartrate: {min: 50, max: 120}, ...}}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Thresholds updated"}` |
+| Not owner/manager | `403` | `{message: "Only device owners and managers can update thresholds"}` |
+| Invalid JSON | `400` | `{message: "Thresholds must be a JSON object"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/resolve-alert</b> — Resolve an alert</summary>
+
+**Body:** `{user_name, alert_id}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Alert resolved"}` |
+| Already resolved | `400` | `{message: "Alert is already resolved"}` |
+| Viewer (no permission) | `401` | `{message: "Viewers cannot resolve alerts"}` |
+| Alert not found | `404` | `{message: "Alert not found"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/acknowledge-alert</b> — Acknowledge an alert</summary>
+
+**Body:** `{user_name, alert_id}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Alert acknowledged"}` |
+| Not triggered | `400` | `{message: "Cannot acknowledge alert in 'resolved' state"}` |
+| No permission | `403` | `{message: "Only owner, manager, or caregiver can acknowledge alerts"}` |
+| Alert not found | `404` | `{message: "Alert not found"}` |
+
+Acknowledging stops escalation. The alert moves from `triggered` → `acknowledged`.
+</details>
+
+**Alert lifecycle:** `triggered` → `acknowledged` → `resolved`
+
+**Escalation:** Unacknowledged alerts re-notify at 5min, 10min, 15min intervals.
+
+**Deduplication:** Same device+measurement won't fire duplicate alerts while one is active.
+
+**Severity routing:** `critical` → push + email, `warning` → push, `info` → in-app only.
+
+---
+
+### Sharing & Permissions
+
+Require **backend auth** + `user_name` in body.
+
+<details>
+<summary><b>POST /mobile/get-device-users</b> — List users with access to a device</summary>
+
+**Body:** `{user_name, device_id}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {users: [{id, name, role, status}, ...]}}` |
+| No access | `401` | `{message: "No access to this device"}` |
+
+Returns both active role holders (`status: "Active"`) and pending invitations (`status: "Pending"`).
+</details>
+
+<details>
+<summary><b>POST /mobile/invite-user</b> — Create a device invitation</summary>
+
+**Body:** `{user_name, device_id, invitee_email?: string, role: "manager"|"caregiver"|"viewer", max_uses?: int}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {invitation_id: 12, invite_token: "abc123..."}, message: "Invitation created"}` |
+| Not owner/manager | `403` | `{message: "Only device owners and managers can invite users"}` |
+| Self-invite | `400` | `{message: "Cannot invite yourself"}` |
+| Duplicate pending | `400` | `{message: "Invitation already pending for this user and device"}` |
+| Invalid role | `400` | `{message: "Invalid role. Must be one of: caregiver, manager, viewer"}` |
+
+Omit `invitee_email` to create a shareable link. Set `max_uses: null` for unlimited uses. Default is single-use. The `invite_token` in the response can be shared as `https://api.homedots.us/invite/<invite_token>`.
+
+If `invitee_email` is provided: sends email + push notification to the invitee (if they have an account).
+</details>
+
+<details>
+<summary><b>POST /mobile/get-invitations</b> — List pending invitations for current user</summary>
+
+**Body:** `{user_name}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {invitations: [{invitation_id, invited_by, device, role, status, invited_at}, ...]}}` |
+
+Shows invitations where the user's email matches `invitee_email`.
+</details>
+
+<details>
+<summary><b>POST /mobile/respond-invitation</b> — Accept or decline an invitation</summary>
+
+**Body:** `{user_name, invitation_id, accept: bool}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Accepted | `200` | `{message: "Invitation accepted"}` |
+| Declined | `200` | `{message: "Invitation declined"}` |
+| Not for you | `403` | `{message: "This invitation is not for you"}` |
+| Already resolved | `404` | `{message: "Invitation not found or already resolved"}` |
+| Expired | `404` | `{message: "Invitation has expired"}` |
+
+Accepting creates a `UserDeviceRole` for the user. Sends push notification to the inviter.
+</details>
+
+<details>
+<summary><b>POST /mobile/accept-invite-link</b> — Accept a shareable invite link</summary>
+
+**Body:** `{user_name, invite_token: string}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {device_id: 42, role: "viewer"}, message: "Invitation accepted"}` |
+| Invalid token | `404` | `{message: "Invalid invite link"}` |
+| Expired | `404` | `{message: "This invite link has expired"}` |
+| Usage limit reached | `400` | `{message: "This invite link has reached its usage limit"}` |
+| Own invitation | `400` | `{message: "Cannot accept your own invitation"}` |
+| Already have access | `400` | `{message: "You already have access to this device"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/remove-device-user</b> — Remove a user's device access</summary>
+
+**Body:** `{user_name, device_id, target_user_id}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "User removed from device"}` |
+| Not owner/manager | `403` | `{message: "Only device owners and managers can remove users"}` |
+| Self-removal | `400` | `{message: "Cannot remove yourself from a device"}` |
+| Target is owner | (no rows deleted) | Returns success with `false` — owner role is protected. |
+
+Sends push notification to the removed user.
+</details>
+
+<details>
+<summary><b>POST /mobile/update-device-user-role</b> — Change a user's role on a device</summary>
+
+**Body:** `{user_name, device_id, target_user_id, new_role: "manager"|"caregiver"|"viewer"}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Role updated"}` |
+| Not owner | `403` | `{message: "Only device owners can change roles"}` |
+| Invalid role | `400` | `{message: "Invalid role. Must be one of: caregiver, manager, viewer"}` |
+
+Only the device owner can change roles (managers cannot). Owner role cannot be changed. Sends push notification to the affected user.
+</details>
+
+---
+
+### Notifications
+
+<details>
+<summary><b>POST /mobile/notifications/register</b> — Register FCM push token (JWT auth)</summary>
+
+**Body:** `{device_token: string, device_info?: string}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Push token registered"}` |
+| Missing token | `400` | `{message: "Missing keys: device_token"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/notifications/unregister</b> — Remove FCM token (JWT auth)</summary>
+
+**Body:** `{device_token: string}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Push token removed"}` |
+</details>
+
+<details>
+<summary><b>POST /mobile/notifications/preferences</b> — Update notification preferences (JWT auth)</summary>
+
+**Body:** `{push_enabled?: bool, email_enabled?: bool}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {push_enabled: true, email_enabled: false}}` |
+
+Send only fields to change. Returns current state after update.
+</details>
+
+<details>
+<summary><b>POST /mobile/notifications/preferences</b> — Get notification preferences (JWT auth)</summary>
+
+**Body:** `{}` (empty body to read current state)
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {push_enabled: true, email_enabled: true}}` |
+
+Send empty body to read. Send `{push_enabled, email_enabled}` to update. Defaults to both enabled if user hasn't set preferences.
+</details>
+
+**Push notifications sent for:** alert triggers, alert escalations, invitation received, invitation accepted/declined, access request received, role changed, user removed from device.
+
+---
+
+### Admin Endpoints
+
+Require **admin JWT** (`is_admin=True` in token).
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /api/v2/admin/tables/<table>/list` | List config table rows (mqtt_conf, influx_conf, forward_conf, ai_conf, tboard_conf) |
+| `POST /api/v2/admin/tables/<table>/create` | Create config row |
+| `POST /api/v2/admin/tables/<table>/update` | Update config row |
+| `POST /api/v2/admin/tables/<table>/delete` | Delete config row |
+| `POST /api/v2/admin/users/mobile` | List all mobile users |
+| `POST /api/v2/admin/users/backend` | List all backend users |
+| `POST /api/v2/admin/users/set-admin` | Toggle admin flag |
+| `POST /api/v2/admin/users/delete` | Delete mobile user |
+| `POST /api/v2/admin/devices/list-all` | List all devices |
+| `POST /api/v2/admin/devices/update` | Update device config |
+| `POST /api/v2/admin/devices/provision-tokens` | Bulk generate claim tokens for device MACs |
+| `POST /api/v2/admin/devices/get-claim-token` | Look up claim token for a device |
+| `POST /api/v2/admin/servers/list` | List forward + AI servers |
+| `POST /api/v2/admin/stats` | Dashboard statistics |
+| `POST /api/v2/admin/device-config/get` | Get device config by MAC |
+| `POST /api/v2/admin/device-config/update` | Update device config |
+| `POST /api/v2/admin/device-config/create` | Create device config |
+| `POST /api/v2/admin/devices/register` | Bulk register devices |
+| `POST /api/v2/admin/devices/activate-registration` | Activate pending registrations |
+| `POST /api/v2/admin/beddot/configure` | Configure BedDot device |
+
+### Backend Server Endpoints
+
+Used by forward servers, AI servers, and devices to authenticate and fetch configs.
+
+| Endpoint | Auth | Description |
+|----------|------|-------------|
+| `POST /api/v2/auth/verify-user` | Backend | Verify user token |
+| `POST /api/v2/auth/verify-device` | Device | Verify device token |
+| `POST /api/v2/auth/verify-forward` | Forward | Verify forward server |
+| `POST /api/v2/auth/verify-ai` | AI | Verify AI server |
+| `POST /api/v2/auth/verify-admin` | Admin | Verify admin token |
+| `POST /api/v2/devices/vitals` | Device | Read device vitals |
+| `POST /api/v2/devices/list-by-user` | Backend | Devices for user |
+| `POST /api/v2/devices/list-by-forward` | Forward | Devices for forward server |
+| `POST /api/v2/devices/list-by-ai` | AI | Devices for AI server |
+| `POST /api/v2/devices/influx-conf` | Device | InfluxDB config for device |
+| `POST /api/v2/devices/mqtt-conf-by-forward` | Forward | MQTT config for forward server |
+| `POST /api/v2/devices/last-seen` | Forward | Record device heartbeat |
+| `POST /api/v2/organizations/list` | Admin | List organizations |
+| `POST /api/v2/organizations/create` | Admin | Create organization |
+| `POST /api/v2/organizations/update` | Admin | Update organization |
+| `POST /api/v2/grafana/info-by-org` | Admin | Grafana info for org |
+| `POST /api/v2/grafana/refresh` | Admin | Refresh Grafana dashboards |
+
+---
+
+## Permission Roles
+
+| | **Owner** | **Manager** | **Caregiver** | **Viewer** |
+|---|---|---|---|---|
+| View vitals & alerts | Yes | Yes | Yes | Yes |
+| Resolve/acknowledge alerts | Yes | Yes | Yes | No |
+| Update alert thresholds | Yes | Yes | No | No |
+| Invite/remove users | Yes | Yes | No | No |
+| Change user roles | Yes | No | No | No |
+| Receive alert notifications | Yes | Optional | Yes | No |
+| Export vitals data | Yes | Yes | Yes | No |
+| Edit device name | Yes | Yes | No | No |
+| Can be removed | No | Yes | Yes | Yes |
+
+**Owner** is auto-assigned when a user adds/pairs a device. Other roles are assigned via invitations.
+
+---
+
+## Response Format
+
+**Success:**
+```json
+{"data": {...}, "message": "Human-readable status"}
+```
+
+**Error:**
+```json
+{"message": "What went wrong", "request_id": "abc-123"}
+```
+
+Common HTTP codes: `400` (validation), `401` (unauthorized), `403` (forbidden), `404` (not found), `409` (conflict), `500` (server error).
 
 ---
 
 ## Integration Notes
 
-Notes for mobile app developers integrating with this API.
+**Auth flow for mobile apps:**
+1. Signup: `/signup` → check email for OTP → `/verify-otp` → tokens returned
+2. Login: `/login` → tokens returned
+3. Google/Apple: `/auth/google` or `/auth/apple` → tokens returned (auto-creates account)
+4. Store `access_token` in memory (not localStorage). Store `refresh_token` securely.
+5. On 401: call `/refresh-token` → get new tokens. If that fails → re-login.
 
-**Password Reset is a 3-step flow:**
-1. `POST /mobile/auth/reset-password` with `email` -- sends a recovery OTP
-2. `POST /mobile/auth/verify-otp` with `email`, `otp_code`, `otp_type: "recovery"` -- verifies the OTP and unlocks the password update
-3. `POST /mobile/auth/update-password` with `email`, `password` -- sets the new password (only works once after step 2)
+**Backend auth (device/group/alert/vitals endpoints):** These use a legacy backend token system. The JWT from login is automatically converted to a backend token by the `requires_backend_auth` decorator — the mobile app doesn't need to manage backend tokens.
 
-**Two auth systems for mobile endpoints:**
-Profile endpoints (`/mobile/user/*`) use JWT from login. All other mobile endpoints (`/mobile/get-*`, `/mobile/invite-*`, etc.) use backend auth, which requires the `user_name` field in the JSON body and a backend token in the `Authorization` header. The `user_name` corresponds to the user record in the legacy `user_conf` table -- this is separate from the `mobile_users` email-based identity. Both identities are linked via the `user_id` foreign key on the `mobile_users` table.
+**Role rename:** `co-owner` was renamed to `manager`. If the app sends `role: "co-owner"`, it will be rejected. Use `"manager"` instead.
 
-**Field naming is `snake_case` throughout.** For example: `device_mac`, `group_id`, `mobile_user_id`, `sleep_goals`, `wake_time`. The mobile app should convert from camelCase if needed.
-
-**Refresh token rotation:** Each call to `/mobile/auth/refresh-token` invalidates the old refresh token and returns a new one. The app must store the new `refresh_token` from the response, otherwise the next refresh will fail.
-
-**OTP delivery is not yet implemented.** The backend generates OTPs and stores them in the database, but does not send emails. During development, you can read the OTP directly from the `mobile_users.otp_code` column. An email service integration is planned.
+**Devices are independent of groups.** `get-groups` returns both `groups` and `ungrouped_devices`. Devices start ungrouped when added.
 
 ---
 
-## Legacy Install (Non-Docker)
+## Deployment
 
-1. Clone the repo
-2. Update `.env` with MySQL credentials
-3. Install `requirements.txt`
-4. Install MySQL:
 ```bash
-sudo apt install mysql-server
-sudo mysql
-CREATE USER 'dotbackend'@'localhost' IDENTIFIED BY 'mysecretpassword';
+# Build Docker image
+docker build --no-cache -t dot_cloud:v2 .
+
+# Start with Docker Compose
+cd docker_image && docker compose up -d
+
+# Run migrations on production DB
+mysql -u dots -p beddot < migrations/004_schema_hardening.sql
+mysql -u dots -p beddot < migrations/005_alert_system_overhaul.sql
 ```
-5. Start the server:
-```bash
-gunicorn -c gunicorn_config.py main:app
-```
+
+Services: Backend (port 4000), MariaDB (internal), InfluxDB (port 4001), Grafana (port 4002).
 
 ---
 
-## Machine Code Conversion
+## Testing
 
-The Dockerfile uses Cython to compile Python source to `.so` machine code during build. The entry point `http_api_server_main.py` is excluded from compilation since it is the gunicorn entry point.
-
-To convert Python code manually:
-1. Back up your source code
-2. Copy `./packing_code/pack_setup.py` to `~/packing_code/`
-3. From the target directory, run:
 ```bash
-python3 ~/packing_code/pack_setup.py build_ext --inplace --include-dirs=/usr/include/python3.10
+# All tests (165 passing)
+python -m pytest tests/ --ignore=v3 -v
+
+# Specific test file
+python -m pytest tests/test_mobile_auth_service.py -v
+
+# By keyword
+python -m pytest tests/ --ignore=v3 -k "test_login" -v
 ```
+
+Tests use SQLite in-memory — no external services needed.
