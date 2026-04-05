@@ -46,6 +46,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/auth/google` | Google Sign-In via JWKS | When adding Google Sign-In to app |
 | `POST /mobile/auth/apple` | Apple Sign-In via JWKS | When adding Apple Sign-In to app |
 | `POST /mobile/update-device` | Rename a device (owner/manager) | When adding device settings UI |
+| `POST /mobile/remove-device` | Unclaim a device, release all access | When adding device removal from account |
 | `POST /mobile/rename-group` | Rename a group | When adding group edit UI |
 | `POST /mobile/request-device-access` | Request view access to another user's device | When adding device sharing discovery |
 | `POST /mobile/acknowledge-alert` | Mark alert as "I'm handling it" (stops escalation) | When adding alert workflow |
@@ -467,6 +468,20 @@ If the device doesn't exist in the database, it's auto-created. `claim_token` is
 | Already pending | `400` | `{message: "Access request already pending for this device"}` |
 
 Creates an invitation with `is_access_request=true` visible in the owner's pending invitations. Owner can accept or decline.
+</details>
+
+<details>
+<summary><b>POST /mobile/remove-device</b> — Unclaim a device and release it</summary>
+
+**Body:** `{user_name, device_mac}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {device_id, device_mac}, message: "Device removed"}` |
+| Not owner | `400` | `{message: "Only the device owner can remove it"}` |
+| Device not found | `404` | `{message: "Device not found"}` |
+
+Releases ownership (`user_id` set to NULL), removes all `user_device_roles` (owner + shared users), removes from all groups. Device becomes claimable by anyone.
 </details>
 
 <details>
