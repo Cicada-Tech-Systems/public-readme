@@ -38,6 +38,9 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/notifications/register` | Was a stub (501) | Now works — registers FCM token | No — was unused |
 | `POST /mobile/notifications/preferences` | Was a stub (501) | Now works — toggles push/email | No — was unused |
 | `POST /mobile/export-vitals` | Was a stub (501) | Now works — returns CSV or JSON file | No — was unused |
+| `POST /mobile/get-device-users` | Returned `{id, name, role, status}` per user. Owner could be missing if they had no role row. | Returns `{id, name, email, role, status}`. Owner always included. Pending invitations resolve `id` from registered accounts. Expired pending invitations filtered out. | **Partial** — new `email` field added. `id` no longer null for registered pending users. |
+| `POST /mobile/invite-user` | Allowed duplicate pending invitations for same email. Did not check if invitee already had access. | Rejects duplicate pending invitations (409). Rejects inviting users who already have access or are the device owner (409). Sets `invitee_user_id` when invitee has an account. | **Partial** — new 409 responses for duplicates |
+| `POST /mobile/update-device-user-role` | Silently returned 200 when trying to change owner's role (no rows updated). Returned 200 for non-existent target users. | Returns 400 `"Cannot change the device owner's role"`. Returns 404 `"Target user not found on this device"`. | **Partial** — new error responses |
 
 ### New Endpoints (not in previous version)
 
@@ -54,6 +57,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/invite-user-to-group` | Invite user to ALL devices in a group | When adding group sharing |
 | `POST /mobile/get-latest-vitals` | Latest reading for all devices in one call | For dashboard home screen |
 | `POST /mobile/notifications/unregister` | Remove FCM token on logout | When implementing push |
+| `POST /mobile/user-profile` | User details + all associated devices with roles | For user profile screen |
 
 ### Removed Endpoints
 
@@ -65,7 +69,7 @@ If your app was built against the previous API, review the items below. Items ma
 
 These endpoints work exactly as documented in the previous version:
 
-`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/remove-device-from-group`, `/mobile/pair-device`, `/mobile/get-dashboard-stats`, `/mobile/get-alert-thresholds`, `/mobile/update-alert-thresholds`, `/mobile/get-device-users`, `/mobile/get-invitations`, `/mobile/remove-device-user`
+`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/remove-device-from-group`, `/mobile/pair-device`, `/mobile/get-dashboard-stats`, `/mobile/get-alert-thresholds`, `/mobile/update-alert-thresholds`, `/mobile/get-invitations`, `/mobile/remove-device-user`
 
 ---
 
@@ -84,7 +88,7 @@ These endpoints work exactly as documented in the previous version:
   - [Group Endpoints](#group-endpoints) (6 endpoints)
   - [Vitals Endpoints](#vitals-endpoints) (3 endpoints)
   - [Alert Endpoints](#alert-endpoints) (6 endpoints)
-  - [Sharing & Permissions](#sharing--permissions) (8 endpoints)
+  - [Sharing & Permissions](#sharing--permissions) (9 endpoints)
   - [Notifications](#notifications) (4 endpoints)
   - [Admin Endpoints](#admin-endpoints)
   - [Backend Server Endpoints](#backend-server-endpoints)
@@ -149,7 +153,7 @@ app/interface/
 
 web/                    # React dashboard (Vite + Tailwind)
 v3/                     # Next-gen FastAPI rewrite
-tests/                  # 165 tests (pytest, SQLite in-memory)
+tests/                  # 181 tests (pytest, SQLite in-memory)
 migrations/             # SQL migration scripts
 docker_image/           # Docker Compose + infrastructure
 ```
@@ -731,10 +735,12 @@ Require **backend auth** + `user_name` in body.
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {users: [{id, name, role, status}, ...]}}` |
+| Success | `200` | `{data: {users: [{id, name, email, role, status}, ...]}}` |
 | No access | `401` | `{message: "No access to this device"}` |
 
-Returns both active role holders (`status: "Active"`) and pending invitations (`status: "Pending"`).
+Returns the device owner (always first, `role: "owner"`), active role holders (`status: "Active"`), and non-expired pending invitations (`status: "Pending"`). The `email` field is included for all users. For pending invitations of registered users, `id` is resolved from their account (no longer `null`).
+
+**Who can call:** Any user with access to the device (owner, manager, caregiver, viewer).
 </details>
 
 <details>
@@ -747,12 +753,14 @@ Returns both active role holders (`status: "Active"`) and pending invitations (`
 | Success | `200` | `{data: {invitation_id: 12, invite_token: "abc123..."}, message: "Invitation created"}` |
 | Not owner/manager | `403` | `{message: "Only device owners and managers can invite users"}` |
 | Self-invite | `400` | `{message: "Cannot invite yourself"}` |
-| Duplicate pending | `400` | `{message: "Invitation already pending for this user and device"}` |
+| Duplicate pending | `409` | `{message: "A pending invitation already exists for this email"}` |
+| Already has access | `409` | `{message: "User already has access to this device"}` |
+| Is device owner | `409` | `{message: "User is the device owner"}` |
 | Invalid role | `400` | `{message: "Invalid role. Must be one of: caregiver, manager, viewer"}` |
 
 Omit `invitee_email` to create a shareable link. Set `max_uses: null` for unlimited uses. Default is single-use. The `invite_token` in the response can be shared as `https://api.homedots.us/invite/<invite_token>`.
 
-If `invitee_email` is provided: sends email + push notification to the invitee (if they have an account).
+If `invitee_email` is provided: sends email + push notification to the invitee (if they have an account). When the invitee has a registered account, `invitee_user_id` is automatically resolved and stored.
 </details>
 
 <details>
@@ -820,11 +828,28 @@ Sends push notification to the removed user.
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{message: "Role updated"}` |
+| Success | `200` | `{message: "User role updated"}` |
 | Not owner | `403` | `{message: "Only device owners can change roles"}` |
+| Target is owner | `400` | `{message: "Cannot change the device owner's role"}` |
+| Target not on device | `404` | `{message: "Target user not found on this device"}` |
 | Invalid role | `400` | `{message: "Invalid role. Must be one of: caregiver, manager, viewer"}` |
 
 Only the device owner can change roles (managers cannot). Owner role cannot be changed. Sends push notification to the affected user.
+</details>
+
+<details>
+<summary><b>POST /mobile/user-profile</b> — Get user details with associated devices</summary>
+
+**Body:** `{user_name}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {user_id, user_name, email, name, status, devices: [{device_id, device_mac, device_description, role}, ...]}}` |
+| User not found | `404` | `{message: "User not found"}` |
+
+Returns the authenticated user's profile along with all devices they have access to. Owned devices have `role: "owner"`. Shared devices show the user's assigned role (`manager`, `caregiver`, or `viewer`).
+
+**Note:** The `user_name` in the body is overridden by the authenticated user's identity — you cannot view another user's profile.
 </details>
 
 ---

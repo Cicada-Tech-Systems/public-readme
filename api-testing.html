@@ -888,7 +888,8 @@ async function runPhaseDevices() {
 // ------------------------------------------------------------------
 // PHASE 4: DEVICE USERS & INVITATIONS
 // Endpoints: get-device-users, invite-user, get-invitations,
-//            respond-invitation, update-device-user-role, remove-device-user
+//            respond-invitation, update-device-user-role, remove-device-user,
+//            user-profile
 // ------------------------------------------------------------------
 async function runPhaseUsers() {
   logSection('4. Sharing Flow — Users → Invite → Respond → Role → Remove → Links → Access Request');
@@ -967,6 +968,16 @@ async function runPhaseUsers() {
     'POST /mobile/request-device-access', '/mobile/request-device-access',
     { user_name: userName, device_mac: 'FF:FF:FF:FF:FF:FF', note: 'Test access request' },
     'backend', [200, 400, 404]
+  );
+
+  // POST /mobile/user-profile
+  // Body: { user_name }
+  // Auth: backend
+  // Returns user details with all associated devices and roles.
+  await runTest(
+    'POST /mobile/user-profile', '/mobile/user-profile',
+    { user_name: userName },
+    'backend', [200, 404]
   );
 }
 
