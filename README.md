@@ -21,7 +21,7 @@ If your app was built against the previous API, review the items below. Items ma
 | Endpoint | Was (old) | Now (new) | Breaking? |
 |----------|-----------|-----------|-----------|
 | `POST /mobile/auth/signup` | 409 if email exists | 409 if verified email exists. Recycles unverified accounts with expired OTP | No |
-| `POST /mobile/add-device` | Required `device_name`, `group_id`. Device had to exist in DB (admin pre-registered). Error if already claimed. | `device_name` and `group_id` are optional. Auto-creates device record. Returns `{status: "device_already_claimed"}` instead of error. Accepts `claim_token`. | **Partial** — check for `status` field in response |
+| `POST /mobile/add-device` | Required `device_name`, `group_id`, `device_mac`. Device had to exist in DB (admin pre-registered). Error if already claimed. | `device_name`, `group_id`, and `device_mac` are all optional. Auto-creates device record. Returns `{status: "device_already_claimed"}` instead of error. Accepts `claim_token` alone (QR code flow — no MAC needed). MAC-like 12-hex-char tokens auto-resolve to MAC addresses. | **Partial** — check for `status` field in response |
 | `POST /mobile/add-device` | Device auto-added to default group | Device starts ungrouped | No |
 | `POST /mobile/get-groups` | Returned `{data: {groups: [...]}}` | Returns `{data: {groups: [...], ungrouped_devices: [...]}}`. New `ungrouped_devices` array. | No — old `groups` key still works |
 | `POST /mobile/get-groups` | Response had `is_default` on groups | `is_default` removed (no default groups) | No — just ignore missing field |
@@ -419,19 +419,30 @@ Soft-deletes the account. User data is retained but inaccessible. Releases all o
 Require **backend auth** (`Authorization: Bearer <token>`) + `user_name` in body.
 
 <details>
-<summary><b>POST /mobile/add-device</b> — Claim a device by MAC address</summary>
+<summary><b>POST /mobile/add-device</b> — Claim a device by MAC address or QR claim token</summary>
 
-**Body:** `{user_name, device_mac, device_name?, claim_token?, group_id?}`
+Two modes of operation:
+
+**Mode 1 — MAC address (manual entry):**
+`{user_name, device_mac, device_name?, claim_token?, group_id?}`
+
+**Mode 2 — QR code / claim token only (no MAC needed):**
+`{user_name, claim_token, device_name?}`
 
 | Response | Status | Body |
 |----------|--------|------|
 | Claimed successfully | `201` | `{data: {status: "claimed", device_id: 42}}` |
-| Already claimed by another user | `200` | `{data: {status: "device_already_claimed", device_id: 42, message: "This device is registered to another user. You can request view access from the owner."}}` |
+| Already claimed by another user | `200` | `{data: {status: "device_already_claimed", device_id: 42, message: "..."}}` |
 | Wrong claim token | `400` | `{message: "Invalid claim token. Check the code on your device label."}` |
 | Invalid MAC format | `400` | `{message: "Invalid MAC address format (expected XX:XX:XX:XX:XX:XX)"}` |
+| Token not found | `404` | `{message: "No device found for this code. Check the QR code on your device."}` |
 | User not found | `404` | `{message: "User not found"}` |
 
-If the device doesn't exist in the database, it's auto-created. `claim_token` is optional for testing but should be enforced in production. If device is already claimed, use `/mobile/request-device-access` to request view permissions.
+**QR code flow:** When only `claim_token` is sent (no `device_mac`), the backend looks up the device by its claim token. If the token is 12 hex characters (e.g. `AABBCCDDEEFF`), it's treated as a MAC address and auto-converted to `AA:BB:CC:DD:EE:FF`. If the device doesn't exist, it's auto-created.
+
+**QR code URL format:** `https://api.homedots.us/claim/{claim_token}`
+
+Each device has a unique 8-character claim token (e.g. `A7XK2M9B`) printed on its label as a QR code. The app scans the QR, extracts the token, and calls this endpoint.
 </details>
 
 <details>

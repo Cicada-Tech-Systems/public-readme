@@ -809,15 +809,26 @@ async function runPhaseDevices() {
     }
   );
 
-  // POST /mobile/add-device
+  // POST /mobile/add-device (MAC mode)
   // Body: { user_name, device_mac, device_name, group_id? }
   // Auth: backend
   // Adds a device by MAC address. Device must exist in device_conf and be unclaimed.
   await runTest(
-    'POST /mobile/add-device', '/mobile/add-device',
+    'POST /mobile/add-device (MAC)', '/mobile/add-device',
     { user_name: userName, device_mac: TEST_DEVICE_MAC, device_name: 'API Test Device', group_id: parseInt(testGroupId) || 1 },
     'backend', [200, 201, 400, 404, 409],
     d => { if (d.data) testDeviceId = d.data.device_id || d.data.id || testDeviceId; }
+  );
+
+  // POST /mobile/add-device (QR claim token mode)
+  // Body: { user_name, claim_token, device_name }
+  // Auth: backend
+  // Claims a device by QR code claim token (no MAC needed).
+  // Also supports 12-hex-char MAC-like tokens (e.g. AABBCCDDEEFF).
+  await runTest(
+    'POST /mobile/add-device (QR)', '/mobile/add-device',
+    { user_name: userName, claim_token: 'NONEXISTENT', device_name: 'QR Test Device' },
+    'backend', [201, 404],
   );
 
   // POST /mobile/add-device-to-group
