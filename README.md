@@ -108,7 +108,7 @@ The backend runs in **dual mode** controlled by `IS_MASTER_SERVER`:
 - **Slave** (`IS_MASTER_SERVER=0`): Forwards API requests to the master server.
 
 Three processes run in Docker via supervisord:
-1. **http_api** — Flask/Gunicorn serving REST APIs + web dashboard
+1. **http_api** — FastAPI/Uvicorn serving REST APIs (auto-generated docs at `/docs`)
 2. **socket_api** — Flask-SocketIO for WebSocket connections
 3. **forward_ga** — MQTT subscriber that writes sensor data to InfluxDB
 
@@ -117,15 +117,25 @@ Three processes run in Docker via supervisord:
 ## Quick Start
 
 ```bash
-# Clone and install
-git clone <repo-url> && cd DotBackendLuo
-pip install -r requirements-dev.txt
+# Clone the API repo
+git clone https://github.com/Cicada-Tech-Systems/homedots-api.git
+cd homedots-api
+
+# Install dependencies
+pip install fastapi uvicorn sqlalchemy pymysql pydantic[email] pyjwt bcrypt slowapi python-dotenv
+
+# Configure (copy and fill in DB credentials)
+cp .env.dev.example .env.dev
+
+# SSH tunnel to database (or connect directly if on the same network)
+ssh -L 3307:127.0.0.1:3307 ga.homedots.us
 
 # Run tests (no external services needed)
-python -m pytest tests/ --ignore=v3 -v
+python -m pytest tests/ -v
 
-# Start server (requires .env with DB credentials)
-cd app/interface/http_api && python http_api_server_main.py
+# Start development server
+python run.py
+# API docs at http://localhost:3425/docs
 ```
 
 ---
@@ -134,16 +144,14 @@ cd app/interface/http_api && python http_api_server_main.py
 
 ```
 app/interface/
-├── http_api/           # API endpoints (Flask blueprints)
-│   ├── auth.py             Auth decorators (JWT, backend token)
-│   ├── validators.py       Input validation (@validate decorator)
-│   ├── mobile_auth_api.py
-│   ├── mobile_devices_api.py
-│   ├── mobile_alerts_api.py
-│   ├── mobile_users_api.py
-│   ├── mobile_vitals_api.py
-│   ├── admin_dashboard_api.py
-│   └── backend_*.py        Server-to-server endpoints
+├── fastapi_app/        # API endpoints (FastAPI routers)
+│   ├── main.py             App factory, middleware, exception handlers
+│   ├── routers/            Route handlers (one per domain)
+│   ├── request_models.py   Pydantic request body models
+│   ├── service_deps.py     Typed service dependency injection
+│   ├── dependencies.py     Auth dependencies (JWT, backend token)
+│   ├── validation.py       Legacy validation for backend routes
+│   └── types.py            Shared TypedDicts
 ├── models/             # SQLAlchemy ORM models
 ├── services/           # Business logic (20+ services)
 ├── tasks/              # Celery async tasks
@@ -153,7 +161,7 @@ app/interface/
 
 web/                    # React dashboard (Vite + Tailwind)
 v3/                     # Next-gen FastAPI rewrite
-tests/                  # 181 tests (pytest, SQLite in-memory)
+tests/                  # 202 tests (pytest, SQLite in-memory)
 migrations/             # SQL migration scripts
 docker_image/           # Docker Compose + infrastructure
 ```
@@ -488,15 +496,17 @@ Creates an invitation with `is_access_request=true` visible in the owner's pendi
 <details>
 <summary><b>POST /mobile/remove-device</b> — Unclaim a device and release it</summary>
 
-**Body:** `{user_name, device_mac}`
+**Body:** `{user_name, device_mac, delete_vitals?: boolean}`
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {device_id, device_mac}, message: "Device removed"}` |
+| Success | `200` | `{data: {device_id, device_mac, vitals_deleted}, message: "Device removed"}` |
 | Not owner | `400` | `{message: "Only the device owner can remove it"}` |
 | Device not found | `404` | `{message: "Device not found"}` |
 
 Releases ownership (`user_id` set to NULL), removes all `user_device_roles` (owner + shared users), removes from all groups. Device becomes claimable by anyone.
+
+Set `delete_vitals: true` to also permanently erase all vital history from InfluxDB. Default is `false` (vitals kept). Call `/mobile/export-vitals` first if the user wants to save a copy.
 </details>
 
 <details>
