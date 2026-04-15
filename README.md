@@ -22,14 +22,18 @@ If your app was built against the previous API, review the items below. Items ma
 |----------|-----------|-----------|-----------|
 | `POST /mobile/auth/signup` | 409 if email exists | 409 if verified email exists. Recycles unverified accounts with expired OTP | No |
 | `POST /mobile/add-device` | Required `device_name`, `group_id`, `device_mac`. Device had to exist in DB (admin pre-registered). Error if already claimed. | `device_name`, `group_id`, and `device_mac` are all optional. Auto-creates device record. Returns `{status: "device_already_claimed"}` instead of error. Accepts `claim_token` alone (QR code flow — no MAC needed). MAC-like 12-hex-char tokens auto-resolve to MAC addresses. | **Partial** — check for `status` field in response |
-| `POST /mobile/add-device` | Device auto-added to default group | Device starts ungrouped | No |
-| `POST /mobile/get-groups` | Returned `{data: {groups: [...]}}` | Returns `{data: {groups: [...], ungrouped_devices: [...]}}`. New `ungrouped_devices` array. | No — old `groups` key still works |
-| `POST /mobile/get-groups` | Response had `is_default` on groups | `is_default` removed (no default groups) | No — just ignore missing field |
+| `POST /mobile/add-device` | Device auto-added to default group | Device starts in "Ungrouped Devices" system group | No |
+| `POST /mobile/get-groups` | Returned `{data: {groups: [...]}}` | Returns `{data: {groups: [...], ungrouped_devices: []}}`. All devices are now in a group. `ungrouped_devices` is always empty (kept for backward compat). Each group has `is_default` field. | No — old `groups` key still works |
+| `POST /mobile/get-groups` | No system group concept | "Ungrouped Devices" is a mandatory system group (`is_default: true`). Cannot be renamed, deleted, or have devices removed from it. Devices auto-move to it when removed from other groups. | No — additive change |
 | `POST /mobile/get-groups` | Device fields: `id`, `name`, `mac_address` | Returns BOTH old (`id`, `name`, `mac_address`) AND new (`device_id`, `device_description`, `device_mac`) field names | No |
 | `POST /mobile/get-devices-with-alerts` | Response had `id`, `name`, `alertCount` | Returns BOTH old AND new field names (`device_id`, `device_description`, `alert_count`) | No |
 | `POST /mobile/get-alerts-by-device` | Response had `id`, `current`, `threshold`, `alertStatus` | Returns BOTH old AND new field names (`alert_id`, `current_value`, `threshold_value`, `alert_status`) plus new `status`, `severity`, `acknowledged_at` | No |
 | `POST /mobile/invite-user` | Required `invitee_email`. Returned `{invitation_id}` | `invitee_email` optional. Returns `{invitation_id, invite_token}`. Sends push notification | **Yes** — role must be `"manager"` not `"co-owner"` |
-| `POST /mobile/delete-group` | Moved devices to default group | Devices become ungrouped | No |
+| `POST /mobile/delete-group` | Moved devices to default group | Devices move to "Ungrouped Devices" system group. Cannot delete the system group itself (400). | No |
+| `POST /mobile/rename-group` | No restrictions | Cannot rename "Ungrouped Devices" system group (400) | **Partial** — handle 400 for default group |
+| `POST /mobile/remove-device-from-group` | Device became ungrouped | Device moves to "Ungrouped Devices". Cannot remove from the system group itself (400). | **Partial** — handle 400 for default group |
+| `POST /mobile/get-dashboard-stats` | Only counted owned devices | Counts owned + shared devices (via roles) | No — more accurate count |
+| `POST /mobile/user-profile` | Returns caller's own profile only | Accepts optional `target_user_id` in body. Returns target's profile (only shared devices shown). Caller must share a device with target. | No — backward compatible |
 | `POST /mobile/resolve-alert` | Any user with device access could resolve | Only owner, manager, caregiver can resolve. Viewers get 401. | **Partial** — viewers will now get errors |
 | `POST /mobile/respond-invitation` | No notification sent | Sends push notification to inviter | No |
 | `POST /mobile/get-vitals` | Returned ~2 data points per hour (full-range aggregation) | Returns ~240 data points per hour (auto-scaled). End timestamp clamped to server time. | No — more data, same format |
@@ -57,7 +61,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/invite-user-to-group` | Invite user to ALL devices in a group | When adding group sharing |
 | `POST /mobile/get-latest-vitals` | Latest reading for all devices in one call | For dashboard home screen |
 | `POST /mobile/notifications/unregister` | Remove FCM token on logout | When implementing push |
-| `POST /mobile/user-profile` | User details + all associated devices with roles | For user profile screen |
+| `POST /mobile/user-profile` | User details + associated devices. Optional `target_user_id` to view another user (must share a device). | For user profile and "view user details" in device user list |
 
 ### Removed Endpoints
 
@@ -69,7 +73,7 @@ If your app was built against the previous API, review the items below. Items ma
 
 These endpoints work exactly as documented in the previous version:
 
-`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/remove-device-from-group`, `/mobile/pair-device`, `/mobile/get-dashboard-stats`, `/mobile/get-alert-thresholds`, `/mobile/update-alert-thresholds`, `/mobile/get-invitations`, `/mobile/remove-device-user`
+`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/pair-device`, `/mobile/get-alert-thresholds`, `/mobile/update-alert-thresholds`, `/mobile/get-invitations`, `/mobile/remove-device-user`
 
 ---
 
@@ -510,15 +514,17 @@ Set `delete_vitals: true` to also permanently erase all vital history from Influ
 </details>
 
 <details>
-<summary><b>POST /mobile/get-groups</b> — List all groups and ungrouped devices</summary>
+<summary><b>POST /mobile/get-groups</b> — List all groups with devices</summary>
 
 **Body:** `{user_name}`
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {groups: [{group_id, group_name, device_count, devices: [{device_id, device_description, device_mac, last_seen_raw, activity_status, role}]}], ungrouped_devices: [...]}}` |
+| Success | `200` | `{data: {groups: [{group_id, group_name, device_count, is_default, devices: [{device_id, device_description, device_mac, last_seen_raw, activity_status, role}]}], ungrouped_devices: []}}` |
 
-Devices not in any group appear in `ungrouped_devices`. Each device includes both old field names (`id`, `name`, `mac_address`) and new field names (`device_id`, `device_description`, `device_mac`) for backward compatibility.
+Every device belongs to a group. The "Ungrouped Devices" group (`is_default: true`) is auto-created and cannot be renamed, deleted, or have devices removed from it. When a device is removed from any other group, it moves to this group automatically. `ungrouped_devices` is always `[]` (kept for backward compatibility).
+
+Each group includes `is_default: true/false`. The default group sorts first. Each device includes both old field names (`id`, `name`, `mac_address`) and new field names (`device_id`, `device_description`, `device_mac`) for backward compatibility.
 </details>
 
 <details>
@@ -562,6 +568,7 @@ Require **backend auth** + `user_name` in body.
 | Success | `200` | `{message: "Group renamed"}` |
 | Not found | `404` | `{message: "Group not found"}` |
 | Not owner | `404` | `{message: "Group not found"}` |
+| Default group | `400` | `{message: "Cannot rename the default group"}` |
 </details>
 
 <details>
@@ -573,8 +580,9 @@ Require **backend auth** + `user_name` in body.
 |----------|--------|------|
 | Success | `200` | `{message: "Group deleted"}` |
 | Not found | `404` | `{message: "Group not found"}` |
+| Default group | `400` | `{message: "Cannot delete the default group"}` |
 
-Devices in the group become ungrouped (not deleted).
+Devices in the deleted group are moved to "Ungrouped Devices" (not deleted).
 </details>
 
 <details>
@@ -861,16 +869,18 @@ Only the device owner can change roles (managers cannot). Owner role cannot be c
 <details>
 <summary><b>POST /mobile/user-profile</b> — Get user details with associated devices</summary>
 
-**Body:** `{user_name}`
+**Body:** `{user_name, target_user_id?: int}`
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {user_id, user_name, email, name, status, devices: [{device_id, device_mac, device_description, role}, ...]}}` |
+| Own profile | `200` | `{data: {user_id, user_name, email, name, status, devices: [{device_id, device_mac, device_description, role}, ...]}}` |
+| Other user's profile | `200` | Same format, but `devices` only includes devices shared between caller and target |
 | User not found | `404` | `{message: "User not found"}` |
+| No shared devices | `401` | `{message: "You do not share any devices with this user"}` |
 
-Returns the authenticated user's profile along with all devices they have access to. Owned devices have `role: "owner"`. Shared devices show the user's assigned role (`manager`, `caregiver`, or `viewer`).
+Without `target_user_id`, returns the authenticated user's profile with all their devices. Owned devices have `role: "owner"`, shared devices show the assigned role.
 
-**Note:** The `user_name` in the body is overridden by the authenticated user's identity — you cannot view another user's profile.
+With `target_user_id`, returns that user's profile — but only devices that both caller and target share are included (privacy protection). Caller must share at least one device with the target.
 </details>
 
 ---
