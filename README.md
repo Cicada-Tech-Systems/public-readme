@@ -534,10 +534,16 @@ Each group includes `is_default: true/false`. The default group sorts first. Eac
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {vitals: {"AA:BB:CC:DD:EE:FF": {time, heartrate, respiratoryrate, systolic, diastolic, movement, quality}, ...}}}` |
+| Success | `200` | `{data: {vitals: {"AA:BB:CC:DD:EE:FF": {heartrate, respiratoryrate, systolic, diastolic, movement, quality, occupancy, time, on_bed, thresholds}, ...}}}` |
 | No devices | `200` | `{data: {vitals: {}}}` |
 
-Single InfluxDB query using `LAST()` aggregate. Safe to poll every 2-3 seconds.
+Every accessible device appears in the response — including ones with no recent data (empty vitals, `on_bed: false`, thresholds still populated).
+
+- `on_bed` — `true` when `occupancy >= 0.5`, `false` otherwise.
+- When `on_bed` is `false`, the medical vitals (`heartrate`, `respiratoryrate`, `systolic`, `diastolic`) are returned as `null` so the dashboard card doesn't render garbage readings.
+- `thresholds` merges the device's saved alert_setting on top of defaults, so a device with only `hr` customised still gets sensible defaults for `rr` / `bph` / `bpl` / `oc`. Shape matches `/mobile/get-alert-thresholds`: `{hr: {min, max}, rr: {min, max}, bph: {min, max}, bpl: {min, max}, oc: {on, off}}`.
+
+One Postgres `last()` query against TimescaleDB regardless of device count. Safe to poll every 2-3 seconds.
 </details>
 
 ---
@@ -635,14 +641,17 @@ Require **backend auth** + `user_name` in body.
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {vitals: [{time, heartrate, respiratoryrate, systolic, diastolic, movement, quality}, ...]}}` |
-| No InfluxDB config | `400` | `{message: "Influx configuration not found for this device"}` |
+| Success | `200` | `{data: {vitals: [{time, heartrate, respiratoryrate, systolic, diastolic, movement, quality, occupancy}, ...], thresholds: {hr, rr, bph, bpl, oc}}}` |
 | No data | `400` | `{message: "Data not found"}` |
 | No access | `401` | `{message: "Unauthorized"}` |
 
 Timestamps are UNIX epoch (seconds). `end_timestamp` is clamped to server's current time. Auto-scales aggregation interval: 1h→15s, 24h→5min, 7d→30min, 30d→2h.
 
-Available measurements: `heartrate`, `respiratoryrate`, `systolic`, `diastolic`, `movement`, `quality`.
+- Any bucket where `occupancy < 0.5` (off-bed) has its medical vitals (`heartrate`, `respiratoryrate`, `systolic`, `diastolic`) returned as `null`, so the chart shows gaps instead of garbage for time spent out of bed.
+- `thresholds` is static for the range — the device's saved `alert_setting` merged on top of defaults. Ships alongside the time series so the chart can render threshold bands without a second round trip.
+- Smoothing is on by default: a trailing moving-average (N=10 buckets) over the gap-filled series, so the line stays continuous through quiet minutes.
+
+Available measurements: `heartrate`, `respiratoryrate`, `systolic`, `diastolic`, `movement`, `quality`, `occupancy`.
 </details>
 
 <details>

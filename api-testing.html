@@ -861,7 +861,9 @@ async function runPhaseDevices() {
   // POST /mobile/get-latest-vitals
   // Body: { user_name }
   // Auth: backend
-  // Returns latest reading for ALL user's devices in one call.
+  // Returns latest reading for ALL user's devices in one call. Each entry
+  // includes occupancy, on_bed flag, and per-device alert thresholds.
+  // Medical vitals are null when on_bed is false.
   await runTest(
     'POST /mobile/get-latest-vitals', '/mobile/get-latest-vitals',
     { user_name: userName },
@@ -1085,7 +1087,9 @@ async function runPhaseVitals() {
   // POST /mobile/get-vitals
   // Body: { user_name, device_mac, start_timestamp, end_timestamp }
   // Auth: backend
-  // Reads vitals from InfluxDB. Returns heartrate, respiratory rate, etc.
+  // Reads vitals from TimescaleDB (with InfluxDB fallback). Returns a
+  // time series plus the device's current alert thresholds. Off-bed
+  // buckets have their medical vitals nulled out.
   await runTest(
     'POST /mobile/get-vitals', '/mobile/get-vitals',
     { user_name: userName, device_mac: alertMac, start_timestamp: now - 86400, end_timestamp: now },
