@@ -15,6 +15,8 @@ If your app was built against the previous API, review the items below. Items ma
 | 1 | **Role renamed** | `co-owner` → `manager` | Replace all `"co-owner"` strings with `"manager"` in invite/role API calls |
 | 2 | **`/mobile/auth/verify-firebase-token` removed** | Firebase phone auth no longer supported | Use `/mobile/auth/google` or `/mobile/auth/apple` instead |
 | 3 | **`/mobile/invite-user` body changed** | `invitee_email` was required, now optional | No action if you always send it. New: response includes `invite_token` field |
+| 4 | **Error status codes reclassified** (2026-04-24) | Many client errors were returning `500` (the raw `AppError` default). They now return the correct 4xx class: `400` (validation), `401` (auth failure), `403` (permission), `404` (not found), `409` (conflict / duplicate). | Clients that branched on `500` as a catch-all for all failures must now handle specific 4xx codes. Messages are unchanged — the change is HTTP status only. |
+| 5 | **Refresh-token rotation revokes the old access token** (2026-04-24) | Calling `/mobile/auth/refresh-token` used to return a new pair but the old access token stayed valid until its `exp`. It is now revoked server-side at rotation time. | After calling `/refresh-token`, replace BOTH stored tokens; requests with the previous access token return `401` even before `exp`. |
 
 ### Changed Endpoints (same path, different behavior)
 
@@ -25,7 +27,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/add-device` | Device auto-added to default group | Device starts in "Ungrouped Devices" system group | No |
 | `POST /mobile/get-groups` | Returned `{data: {groups: [...]}}` | Returns `{data: {groups: [...], ungrouped_devices: []}}`. All devices are now in a group. `ungrouped_devices` is always empty (kept for backward compat). Each group has `is_default` field. | No — old `groups` key still works |
 | `POST /mobile/get-groups` | No system group concept | "Ungrouped Devices" is a mandatory system group (`is_default: true`). Cannot be renamed, deleted, or have devices removed from it. Devices auto-move to it when removed from other groups. | No — additive change |
-| `POST /mobile/get-groups` | Device fields: `id`, `name`, `mac_address` | Returns BOTH old (`id`, `name`, `mac_address`) AND new (`device_id`, `device_description`, `device_mac`) field names | No |
+| `POST /mobile/get-groups` | Device/group fields: `id`, `name`, `mac_address` | Returns ONLY new names: `device_id`, `device_description`, `device_mac`, `group_id`, `group_name`. The legacy duplicate aliases were removed in the 2026-04-24 release. | **Yes** — clients still reading `id`/`name`/`mac_address` must switch to the new names |
 | `POST /mobile/get-devices-with-alerts` | Response had `id`, `name`, `alertCount` | Returns BOTH old AND new field names (`device_id`, `device_description`, `alert_count`) | No |
 | `POST /mobile/get-alerts-by-device` | Response had `id`, `current`, `threshold`, `alertStatus` | Returns BOTH old AND new field names (`alert_id`, `current_value`, `threshold_value`, `alert_status`) plus new `status`, `severity`, `acknowledged_at` | No |
 | `POST /mobile/invite-user` | Required `invitee_email`. Returned `{invitation_id}` | `invitee_email` optional. Returns `{invitation_id, invite_token}`. Sends push notification | **Yes** — role must be `"manager"` not `"co-owner"` |
@@ -37,7 +39,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/resolve-alert` | Any user with device access could resolve | Only owner, manager, caregiver can resolve. Viewers get 401. | **Partial** — viewers will now get errors |
 | `POST /mobile/respond-invitation` | No notification sent | Sends push notification to inviter | No |
 | `POST /mobile/get-vitals` | Returned ~2 data points per hour (full-range aggregation) | Returns ~240 data points per hour (auto-scaled). End timestamp clamped to server time. | No — more data, same format |
-| `POST /mobile/update-device-user-role` | Owner or co-owner could change roles | Only owner can change roles (managers cannot) | **Partial** — managers will now get 403 |
+| `POST /mobile/update-device-user-role` | Owner or co-owner could change roles | Owner AND manager can change non-owner roles. Viewers and caregivers get 403. The owner's role cannot be changed via this endpoint (use `remove-device` to unclaim). | **Partial** — caregivers/viewers will now get 403 |
 | `POST /mobile/user/delete-account` | Was a stub (501) | Now works — soft-deletes account | No |
 | `POST /mobile/notifications/register` | Was a stub (501) | Now works — registers FCM token | No — was unused |
 | `POST /mobile/notifications/preferences` | Was a stub (501) | Now works — toggles push/email | No — was unused |
@@ -52,6 +54,7 @@ If your app was built against the previous API, review the items below. Items ma
 |----------|---------|---------------|
 | `POST /mobile/auth/google` | Google Sign-In via JWKS | When adding Google Sign-In to app |
 | `POST /mobile/auth/apple` | Apple Sign-In via JWKS | When adding Apple Sign-In to app |
+| `POST /mobile/auth/logout` | Revoke the current access + refresh tokens server-side | When adding sign-out (recommended — stops stolen tokens from being usable) |
 | `POST /mobile/update-device` | Rename a device (owner/manager) | When adding device settings UI |
 | `POST /mobile/remove-device` | Unclaim a device, release all access | When adding device removal from account |
 | `POST /mobile/rename-group` | Rename a group | When adding group edit UI |
@@ -203,9 +206,15 @@ Two auth types:
 | Type | Header | Used by |
 |------|--------|---------|
 | **JWT (Mobile)** | `Authorization: Bearer <jwt>` | Profile, notifications endpoints |
-| **Backend Auth** | `Authorization: Bearer <backend_token>` + `user_name` in body | Device, vitals, alert, sharing endpoints |
+| **Backend Auth** | `Authorization: Bearer <backend_token>` | Device, vitals, alert, sharing endpoints |
 
-JWT tokens are obtained via `/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/google`, or `/mobile/auth/apple`. They expire in 1 hour. Use `/mobile/auth/refresh-token` to get a new one.
+JWT tokens are obtained via `/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/google`, or `/mobile/auth/apple`. Access tokens expire in 1 hour. Use `/mobile/auth/refresh-token` to mint a fresh pair — the refresh endpoint also **revokes the old access token** (and the old refresh token), so callers should replace both after a refresh call.
+
+**Token claims:** JWTs carry `jti` (unique id), `aud: "homedots-mobile"`, `iss: "homedots"`, `exp`, and `user_name` (resolved at mint time from the authoritative user record). Tokens that are revoked server-side — via `/mobile/auth/logout` or by the refresh-rotation step — are rejected even before expiry.
+
+**`user_name` in request bodies:** Backend endpoints previously required `user_name` in the body. The server now derives the authoritative `user_name` from the JWT's `user_name` claim and only uses the body field as a legacy fallback when the claim is absent. Clients should keep sending it for compatibility, but **must not rely on being able to act as a different `user_name` than the token was minted for** — that path is closed.
+
+**Rate limits:** `/mobile/auth/login`, `/mobile/auth/signup`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, and `/mobile/accept-invite-link` are rate-limited to **5 requests / minute per IP**. Exceeding the limit returns `429 Too Many Requests`.
 
 ### Input Validation
 
@@ -223,7 +232,7 @@ JWT tokens are obtained via `/mobile/auth/login`, `/mobile/auth/verify-otp`, `/m
 
 ### Auth Endpoints
 
-All `POST` to `/mobile/auth/*`. No authentication required. Rate-limited.
+All `POST` to `/mobile/auth/*`. No authentication required except where noted (logout, update-password). Rate-limited to **5 requests / minute per IP** for signup, login, OTP verify / resend, password reset, and invite-link accept — exceeding the limit returns `429`.
 
 <details>
 <summary><b>POST /mobile/auth/signup</b> — Register a new account</summary>
@@ -325,8 +334,25 @@ Must call `verify-otp` with `otp_type: "recovery"` first. Password update window
 | Invalid token | `401` | `{message: "Invalid refresh token"}` |
 | Expired token | `401` | `{message: "Invalid refresh token"}` |
 | Already rotated | `401` | `{message: "Invalid refresh token"}` |
+| Token revoked | `401` | `{message: "Invalid refresh token"}` |
+| Rate limited | `429` | `{message: "Rate limit exceeded"}` |
 
-Old refresh token is invalidated on success (rotation). Store the new `refresh_token`.
+On success the server rotates BOTH tokens: the old refresh token and the old access token it was paired with are both added to the revocation list. The client must replace **both** stored tokens with the returned pair — calls with the previous access token will start returning `401` after the refresh round-trip even though it hasn't hit its `exp` yet.
+</details>
+
+<details>
+<summary><b>POST /mobile/auth/logout</b> — Revoke the current tokens server-side</summary>
+
+**Body:** `{refresh_token?: string}` — optional. If supplied, both the refresh-token jti and the linked access-token jti are revoked. If omitted, only the access token from the `Authorization` header is revoked.
+
+**Auth:** requires JWT (`Authorization: Bearer <access_token>`).
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Logged out"}` |
+| Missing/expired access token | `401` | `{message: "Token has expired"}` or `{message: "Bearer token is missing"}` |
+
+Revocation entries self-expire after the token's own `exp`, so the blocklist doesn't grow without bound.
 </details>
 
 <details>
@@ -352,9 +378,10 @@ Old refresh token is invalidated on success (rotation). Store the new `refresh_t
 |----------|--------|------|
 | Success | `200` | `{data: {access_token, refresh_token, user: {...}}, message: "Authenticated via Apple"}` |
 | No email available | `400` | `{message: "Email is required. Apple may not include it after first login."}` |
+| Email not verified | `401` | `{message: "Apple email is not verified"}` |
 | Invalid token | `401` | `{message: "Invalid Apple token"}` |
 
-Apple only sends `email` on first authorization. After that, the client must cache and send it in the request body.
+Apple only sends `email` on first authorization. After that, the client must cache and send it in the request body. The `email_verified` claim is now validated — matches the Google sign-in behavior.
 </details>
 
 **Password reset flow:** `reset-password` → `verify-otp` (recovery) → `update-password`
@@ -524,7 +551,7 @@ Set `delete_vitals: true` to also permanently erase all vital history from Influ
 
 Every device belongs to a group. The "Ungrouped Devices" group (`is_default: true`) is auto-created and cannot be renamed, deleted, or have devices removed from it. When a device is removed from any other group, it moves to this group automatically. `ungrouped_devices` is always `[]` (kept for backward compatibility).
 
-Each group includes `is_default: true/false`. The default group sorts first. Each device includes both old field names (`id`, `name`, `mac_address`) and new field names (`device_id`, `device_description`, `device_mac`) for backward compatibility.
+Each group includes `is_default: true/false`. The default group sorts first. As of the 2026-04-24 release, only the **new** field names are returned — `device_id`, `device_description`, `device_mac` (for devices) and `group_id`, `group_name` (for groups). The legacy duplicates `id` / `name` / `mac_address` have been removed.
 </details>
 
 <details>
@@ -880,14 +907,15 @@ Only the device owner can change roles (managers cannot). Owner role cannot be c
 <details>
 <summary><b>POST /mobile/user-profile</b> — Get user details with associated devices</summary>
 
-**Body:** `{user_name, target_user_id?: int}`
+**Body:** `{user_name?: string, target_user_id?: int}` — validated by a Pydantic model. Passing a non-integer `target_user_id` now returns `422` with a structured validation error instead of the previous generic 500.
 
 | Response | Status | Body |
 |----------|--------|------|
 | Own profile | `200` | `{data: {user_id, user_name, email, name, status, devices: [{device_id, device_mac, device_description, role}, ...]}}` |
 | Other user's profile | `200` | Same format, but `devices` only includes devices shared between caller and target |
 | User not found | `404` | `{message: "User not found"}` |
-| No shared devices | `401` | `{message: "You do not share any devices with this user"}` |
+| No shared devices | `403` | `{message: "You do not share any devices with this user"}` |
+| Bad `target_user_id` (not int) | `422` | Pydantic validation error envelope |
 
 Without `target_user_id`, returns the authenticated user's profile with all their devices. Owned devices have `role: "owner"`, shared devices show the assigned role.
 
