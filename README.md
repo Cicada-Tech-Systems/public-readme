@@ -541,6 +541,7 @@ Every accessible device appears in the response — including ones with no recen
 
 - `on_bed` — `true` when `occupancy >= 0.5`, `false` otherwise.
 - When `on_bed` is `false`, the medical vitals (`heartrate`, `respiratoryrate`, `systolic`, `diastolic`) are returned as `null` so the dashboard card doesn't render garbage readings.
+- `movement` is the **count** of data points with any movement recorded in the lookback window (default 1 hour), not the raw enum value. Higher number = more restless.
 - `thresholds` merges the device's saved alert_setting on top of defaults, so a device with only `hr` customised still gets sensible defaults for `rr` / `bph` / `bpl` / `oc`. Shape matches `/mobile/get-alert-thresholds`: `{hr: {min, max}, rr: {min, max}, bph: {min, max}, bpl: {min, max}, oc: {on, off}}`.
 
 One Postgres `last()` query against TimescaleDB regardless of device count. Safe to poll every 2-3 seconds.
@@ -648,6 +649,7 @@ Require **backend auth** + `user_name` in body.
 Timestamps are UNIX epoch (seconds). `end_timestamp` is clamped to server's current time. Auto-scales aggregation interval: 1h→15s, 24h→5min, 7d→30min, 30d→2h.
 
 - Any bucket where `occupancy < 0.5` (off-bed) has its medical vitals (`heartrate`, `respiratoryrate`, `systolic`, `diastolic`) returned as `null`, so the chart shows gaps instead of garbage for time spent out of bed.
+- `movement` is the **count** of data points with movement in each bucket, not the raw enum (averaging the enum gives meaningless values like `7`). Plot it as a histogram/bar chart, not a line.
 - `thresholds` is static for the range — the device's saved `alert_setting` merged on top of defaults. Ships alongside the time series so the chart can render threshold bands without a second round trip.
 - Smoothing is on by default: a trailing moving-average (N=10 buckets) over the gap-filled series, so the line stays continuous through quiet minutes.
 
