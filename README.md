@@ -17,6 +17,9 @@ If your app was built against the previous API, review the items below. Items ma
 | 3 | **`/mobile/invite-user` body changed** | `invitee_email` was required, now optional | No action if you always send it. New: response includes `invite_token` field |
 | 4 | **Error status codes reclassified** (2026-04-24) | Many client errors were returning `500` (the raw `AppError` default). They now return the correct 4xx class: `400` (validation), `401` (auth failure), `403` (permission), `404` (not found), `409` (conflict / duplicate). | Clients that branched on `500` as a catch-all for all failures must now handle specific 4xx codes. Messages are unchanged — the change is HTTP status only. |
 | 5 | **Refresh-token rotation revokes the old access token** (2026-04-24) | Calling `/mobile/auth/refresh-token` used to return a new pair but the old access token stayed valid until its `exp`. It is now revoked server-side at rotation time. | After calling `/refresh-token`, replace BOTH stored tokens; requests with the previous access token return `401` even before `exp`. |
+| 6 | **Auth rate limits raised** (2026-04-24) | All auth endpoints were uniformly `5/min`. Login bumped to `30/min`, verify-otp `15/min`, signup `10/min`. Email-sending endpoints (resend-otp, reset-password) stay at `5/min`. | None — clients only see fewer 429s. |
+| 7 | **Email + MAC normalisation** (2026-04-25) | `email` / `invitee_email` / `device_mac` were stored verbatim. Server now lowercases + strips before any lookup or write; existing rows backfilled. | None — already-normalised input is a no-op. Mobile clients should still send the original case for display, but stop hand-rolling case-folding for the wire. |
+| 8 | **Invite remove/role-change require ONE of target_user_id or target_email** (2026-04-25) | `RemoveDeviceUserBody` / `UpdateDeviceUserRoleBody` previously required `target_user_id: int`. Sending `target_user_id: null` for a pending-invite-to-unregistered-email failed with a generic 422 / 404. They now accept either field; clients must send exactly one. | **Yes** — clients sending `target_user_id: null` for unregistered invitees must switch to `target_email: <email>` (the email is already in the `get-device-users` response). |
 
 ### Changed Endpoints (same path, different behavior)
 
@@ -214,7 +217,16 @@ JWT tokens are obtained via `/mobile/auth/login`, `/mobile/auth/verify-otp`, `/m
 
 **`user_name` in request bodies:** Backend endpoints previously required `user_name` in the body. The server now derives the authoritative `user_name` from the JWT's `user_name` claim and only uses the body field as a legacy fallback when the claim is absent. Clients should keep sending it for compatibility, but **must not rely on being able to act as a different `user_name` than the token was minted for** — that path is closed.
 
-**Rate limits:** `/mobile/auth/login`, `/mobile/auth/signup`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, and `/mobile/accept-invite-link` are rate-limited to **5 requests / minute per IP**. Exceeding the limit returns `429 Too Many Requests`.
+**Rate limits (per IP):** mobile clients sit behind carrier NAT, so the limits favour real retry behaviour over abuse paranoia. Endpoints that send email stay tight; ones that don't are loose enough to absorb autofill/typo retries. Exceeding any limit returns `429 Too Many Requests`.
+
+| Endpoint | Limit |
+|---|---|
+| `/mobile/auth/login` | **30 / min** |
+| `/mobile/auth/verify-otp` | **15 / min** |
+| `/mobile/auth/signup` | **10 / min** |
+| `/mobile/auth/resend-otp` | 5 / min (sends email) |
+| `/mobile/auth/reset-password` | 5 / min (sends email) |
+| `/mobile/accept-invite-link` | 5 / min |
 
 ### Input Validation
 
@@ -232,7 +244,9 @@ JWT tokens are obtained via `/mobile/auth/login`, `/mobile/auth/verify-otp`, `/m
 
 ### Auth Endpoints
 
-All `POST` to `/mobile/auth/*`. No authentication required except where noted (logout, update-password). Rate-limited to **5 requests / minute per IP** for signup, login, OTP verify / resend, password reset, and invite-link accept — exceeding the limit returns `429`.
+All `POST` to `/mobile/auth/*`. No authentication required except where noted (logout, update-password). Per-IP rate limits — see the table above; expect `429 Too Many Requests` past the cap.
+
+**Email normalisation (2026-04-25):** every endpoint accepting `email` / `invitee_email` server-side lowercases + strips before any lookup or storage. Clients can keep sending whatever case the user typed; the backend canonicalises. Existing rows in the DB have been lower-cased to match.
 
 <details>
 <summary><b>POST /mobile/auth/signup</b> — Register a new account</summary>
@@ -876,32 +890,35 @@ Accepting creates a `UserDeviceRole` for the user. Sends push notification to th
 <details>
 <summary><b>POST /mobile/remove-device-user</b> — Remove a user's device access</summary>
 
-**Body:** `{user_name, device_id, target_user_id}`
+**Body:** `{device_id, target_user_id?, target_email?}` — provide **exactly one** of `target_user_id` or `target_email`. Use `target_email` when revoking a pending invitation that was sent to an address with no registered account yet (`get-device-users` returns `user_id: null` for those rows — pass the row's `email` here instead). Otherwise pass `target_user_id`.
 
 | Response | Status | Body |
 |----------|--------|------|
 | Success | `200` | `{message: "User removed from device"}` |
+| Both/neither identifier given | `422` | `{message: "Provide exactly one of target_user_id or target_email"}` |
 | Not owner/manager | `403` | `{message: "Only device owners and managers can remove users"}` |
 | Self-removal | `400` | `{message: "Cannot remove yourself from a device"}` |
-| Target is owner | (no rows deleted) | Returns success with `false` — owner role is protected. |
+| Target is device owner | `400` | `{message: "Cannot remove the device owner; unclaim the device instead"}` |
+| Target not on device & no pending invite | `404` | `{message: "User is not a member of this device"}` |
 
-Sends push notification to the removed user.
+Removes the `user_device_roles` row (if any) and revokes any matching pending invitations. Push notification fires only when an actual role row was removed — pending-invite-only revocations are silent (no app to notify).
 </details>
 
 <details>
 <summary><b>POST /mobile/update-device-user-role</b> — Change a user's role on a device</summary>
 
-**Body:** `{user_name, device_id, target_user_id, new_role: "manager"|"caregiver"|"viewer"}`
+**Body:** `{device_id, target_user_id?, target_email?, new_role: "manager"|"caregiver"|"viewer"}` — same `target_user_id` / `target_email` rule as `remove-device-user`. The `target_email` branch updates the role on a still-pending invitation, so the invitee comes in with the corrected role when they accept.
 
 | Response | Status | Body |
 |----------|--------|------|
 | Success | `200` | `{message: "User role updated"}` |
-| Not owner | `403` | `{message: "Only device owners can change roles"}` |
+| Both/neither identifier given | `422` | `{message: "Provide exactly one of target_user_id or target_email"}` |
+| Not owner/manager | `403` | `{message: "Only device owners and managers can change roles"}` |
 | Target is owner | `400` | `{message: "Cannot change the device owner's role"}` |
 | Target not on device | `404` | `{message: "Target user not found on this device"}` |
 | Invalid role | `400` | `{message: "Invalid role. Must be one of: caregiver, manager, viewer"}` |
 
-Only the device owner can change roles (managers cannot). Owner role cannot be changed. Sends push notification to the affected user.
+Owner AND manager roles can change non-owner roles (manager-OK policy). Owner's own role is immutable here — use `remove-device` to unclaim instead. Push notification fires only on role rows; pending-invite role changes are silent.
 </details>
 
 <details>
