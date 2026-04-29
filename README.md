@@ -20,6 +20,8 @@ If your app was built against the previous API, review the items below. Items ma
 | 6 | **Auth rate limits raised** (2026-04-24) | All auth endpoints were uniformly `5/min`. Login bumped to `30/min`, verify-otp `15/min`, signup `10/min`. Email-sending endpoints (resend-otp, reset-password) stay at `5/min`. | None — clients only see fewer 429s. |
 | 7 | **Email + MAC normalisation** (2026-04-25) | `email` / `invitee_email` / `device_mac` were stored verbatim. Server now lowercases + strips before any lookup or write; existing rows backfilled. | None — already-normalised input is a no-op. Mobile clients should still send the original case for display, but stop hand-rolling case-folding for the wire. |
 | 8 | **Invite remove/role-change require ONE of target_user_id or target_email** (2026-04-25) | `RemoveDeviceUserBody` / `UpdateDeviceUserRoleBody` previously required `target_user_id: int`. Sending `target_user_id: null` for a pending-invite-to-unregistered-email failed with a generic 422 / 404. They now accept either field; clients must send exactly one. | **Yes** — clients sending `target_user_id: null` for unregistered invitees must switch to `target_email: <email>` (the email is already in the `get-device-users` response). |
+| 9 | **Master/slave mode removed** (2026-04-29) | The `IS_MASTER_SERVER` dual-mode pattern, the `_post_to_master` slave-forwarding path, and the legacy `auth_user(user_name, user_token)` body-based auth path were all deleted. The backend is single-master now. JWT is the only mobile-auth mechanism. | Drop `IS_MASTER_SERVER`, `MASTER_SERVER_URL`, and the legacy backend `user_token` from your env / config. If you ran a slave deployment, redeploy as master against the prod DB. Future multi-region / HIPAA deployments will get a fresh service-auth design (mTLS / service JWTs). |
+| 10 | **JWT carries `user_id` claim alongside `mobile_user_id`** (2026-04-29) | The user_conf + mobile_users merge unified the user table. JWTs minted post-merge include both `user_id` (canonical going forward) and `mobile_user_id` (back-compat) so in-flight tokens keep working. The two values are equal. | Prefer reading `user_id` from JWT payloads. The `mobile_user_id` claim will be removed after the refresh-token rollover window (~2026-05-29). |
 
 ### Changed Endpoints (same path, different behavior)
 
@@ -50,6 +52,9 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/get-device-users` | Returned `{id, name, role, status}` per user. Owner could be missing if they had no role row. | Returns `{id, name, email, role, status}`. Owner always included. Pending invitations resolve `id` from registered accounts. Expired pending invitations filtered out. | **Partial** — new `email` field added. `id` no longer null for registered pending users. |
 | `POST /mobile/invite-user` | Allowed duplicate pending invitations for same email. Did not check if invitee already had access. | Rejects duplicate pending invitations (409). Rejects inviting users who already have access or are the device owner (409). Sets `invitee_user_id` when invitee has an account. | **Partial** — new 409 responses for duplicates |
 | `POST /mobile/update-device-user-role` | Silently returned 200 when trying to change owner's role (no rows updated). Returned 200 for non-existent target users. | Returns 400 `"Cannot change the device owner's role"`. Returns 404 `"Target user not found on this device"`. | **Partial** — new error responses |
+| `POST /mobile/get-device-users` (2026-04-29) | Pending invitations returned `id: null` when the invitee had no account, leaving the mobile app with no stable row key. | Each row now carries `invitation_id` alongside `id`. Pending rows have a non-null `invitation_id`; Active rows have `invitation_id: null`. | No — additive field |
+| `POST /mobile/get-invitations` (2026-04-29) | Returned only Pending received invitations. Body was `{}`. Response per row had `invitation_id, invited_by, device, role, status, invited_at`. | Body now accepts `{include_resolved: bool}` (default `false` keeps inbox-only). Response gains `note`, `expires_at`, `invitee_email` per row. | No — additive |
+| `POST /mobile/accept-invite-link` (2026-04-29) | A targeted invite (where `invitee_email` was set) could only be accepted by an account whose registered email matched. | The email lock is now only enforced when the invitee already had an account at invite time (`invitee_user_id` set). Targeted invites to unregistered emails accept under any email — the recipient may have signed up under a different one. | No — strictly more permissive |
 
 ### New Endpoints (not in previous version)
 
@@ -68,6 +73,8 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/get-latest-vitals` | Latest reading for all devices in one call | For dashboard home screen |
 | `POST /mobile/notifications/unregister` | Remove FCM token on logout | When implementing push |
 | `POST /mobile/user-profile` | User details + associated devices. Optional `target_user_id` to view another user (must share a device). | For user profile and "view user details" in device user list |
+| `POST /mobile/get-sent-invitations` (2026-04-29) | Outbox view — invitations the caller has sent. Returns all statuses (Pending/Active/Declined/Expired/Revoked) with `invite_token` for the copy-link UI action, plus `note`, `sent_at`, `expires_at`, `use_count`, `max_uses`. | When adding a "Sent" tab to the invitations page |
+| `POST /mobile/resend-invitation` (2026-04-29) | Re-fires the invite email + push for a Pending invitation. Caller must be the original inviter. No DB state change (token, expiry, status preserved). | When adding a "Resend" button to the Sent invitations page |
 
 ### Removed Endpoints
 
@@ -112,15 +119,15 @@ These endpoints work exactly as documented in the previous version:
 
 ## Architecture
 
-The backend runs in **dual mode** controlled by `IS_MASTER_SERVER`:
+Single-master FastAPI backend backed by **PostgreSQL with TimescaleDB** (continuous aggregates for vitals rollups), Valkey for caching/rate-limiting/Celery broker, and Celery workers for async email + alert delivery. The legacy `IS_MASTER_SERVER` master/slave forwarding pattern was removed in 2026-04-29; future multi-region or HIPAA-compliant deployments will get a fresh service-auth design (mTLS / service JWTs).
 
-- **Master** (`IS_MASTER_SERVER=1`): Connects directly to MySQL, InfluxDB, Grafana.
-- **Slave** (`IS_MASTER_SERVER=0`): Forwards API requests to the master server.
-
-Three processes run in Docker via supervisord:
-1. **http_api** — FastAPI/Uvicorn serving REST APIs (auto-generated docs at `/docs`)
-2. **socket_api** — Flask-SocketIO for WebSocket connections
-3. **forward_ga** — MQTT subscriber that writes sensor data to InfluxDB
+Containers in production:
+1. **dot_cloud** — FastAPI/Uvicorn serving the REST API (auto-generated OpenAPI at `/docs`)
+2. **dot_celery_worker** — Celery worker for background tasks (email send, alert dispatch, push notifications)
+3. **dot_celery_beat** — Celery beat for scheduled tasks
+4. **dot_forward_ga** — MQTT subscriber that writes sensor data to TimescaleDB
+5. **dot_postgres** — PostgreSQL + TimescaleDB
+6. **dot_valkey** — Valkey (Redis-compatible) for cache, rate limit counters, Celery broker
 
 ---
 
@@ -132,13 +139,13 @@ git clone https://github.com/Cicada-Tech-Systems/homedots-api.git
 cd homedots-api
 
 # Install dependencies
-pip install fastapi uvicorn sqlalchemy pymysql pydantic[email] pyjwt bcrypt slowapi python-dotenv
+pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic[email] pyjwt bcrypt slowapi python-dotenv celery valkey
 
 # Configure (copy and fill in DB credentials)
 cp .env.dev.example .env.dev
 
-# SSH tunnel to database (or connect directly if on the same network)
-ssh -L 3307:127.0.0.1:3307 ga.homedots.us
+# SSH tunnel to PostgreSQL (or connect directly if on the same network)
+ssh -L 5432:127.0.0.1:5432 ga.homedots.us
 
 # Run tests (no external services needed)
 python -m pytest tests/ -v
@@ -182,13 +189,14 @@ docker_image/           # Docker Compose + infrastructure
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `IS_MASTER_SERVER` | Yes | `0` | `1` = direct DB, `0` = slave mode |
 | `JWT_SECRET` | Yes | - | Secret for JWT signing |
-| `SQL_HOST` | Master | `localhost` | MySQL/MariaDB host |
-| `SQL_DATABASE` | Master | `beddot` | Database name |
-| `SQL_USER` | Master | - | Database username |
-| `SQL_PASSWORD` | Master | - | Database password |
-| `MASTER_SERVER_URL` | Slave | - | URL of master server |
+| `SQL_DRIVER` | Yes | `postgresql+psycopg2` | SQLAlchemy driver string |
+| `SQL_HOST` | Yes | `postgres` | PostgreSQL host |
+| `SQL_PORT` | Yes | `5432` | PostgreSQL port |
+| `SQL_DATABASE` | Yes | `homedots` | Database name |
+| `SQL_USER` | Yes | - | Database username |
+| `SQL_PASSWORD` | Yes | - | Database password |
+| `VALKEY_URL` | Yes | `redis://valkey:6379/0` | Valkey/Redis broker for cache + Celery |
 | `EMAIL_SERVICE_URL` | No | - | Nodemailer HTTP endpoint |
 | `FIREBASE_CREDENTIALS` | No | - | Firebase JSON (FCM push only) |
 | `APP_BASE_URL` | No | `https://api.homedots.us` | Base URL for deep links |
@@ -197,6 +205,8 @@ docker_image/           # Docker Compose + infrastructure
 | `SSL_VERIFY` | No | `true` | SSL verification for outbound requests |
 | `LOG_LEVEL` | No | `WARNING` | Python logging level |
 | `CORS_ORIGINS` | No | `https://homedots.us,...` | Allowed CORS origins |
+
+`IS_MASTER_SERVER` and `MASTER_SERVER_URL` were removed in 2026-04-29. If you have them set in old config, drop them — they have no effect.
 
 ---
 
@@ -816,10 +826,14 @@ Require **backend auth** + `user_name` in body.
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {users: [{id, name, email, role, status}, ...]}}` |
+| Success | `200` | `{data: {users: [{id, invitation_id, name, email, role, status}, ...]}}` |
 | No access | `401` | `{message: "No access to this device"}` |
 
-Returns the device owner (always first, `role: "owner"`), active role holders (`status: "Active"`), and non-expired pending invitations (`status: "Pending"`). The `email` field is included for all users. For pending invitations of registered users, `id` is resolved from their account (no longer `null`).
+Returns the device owner (always first, `role: "owner"`), active role holders (`status: "Active"`), and non-expired pending invitations (`status: "Pending"`). The `email` field is included for all users.
+
+Per row:
+- `id` — `user_id` of the account, or `null` for pending invitations to addresses that don't have an account yet.
+- `invitation_id` — set on Pending rows so the mobile app has a stable row key when `id` is null. `null` on Active rows. Use this to target `/mobile/cancel-invitation`, `/mobile/update-invitation`, or `/mobile/resend-invitation` directly without going through email.
 
 **Who can call:** Any user with access to the device (owner, manager, caregiver, viewer).
 </details>
@@ -845,15 +859,49 @@ If `invitee_email` is provided: sends email + push notification to the invitee (
 </details>
 
 <details>
-<summary><b>POST /mobile/get-invitations</b> — List pending invitations for current user</summary>
+<summary><b>POST /mobile/get-invitations</b> — List invitations received by the current user</summary>
 
-**Body:** `{user_name}`
+**Body:** `{include_resolved?: bool}` — default `false` returns Pending only (the inbox view). Pass `true` to get the full received history (Pending + Active + Declined + Expired + Revoked).
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {invitations: [{invitation_id, invited_by, device, role, status, invited_at}, ...]}}` |
+| Success | `200` | `{data: {invitations: [{id, invitation_id, invited_by, device, role, status, note, invited_at, expires_at, invitee_email}, ...]}}` |
 
-Shows invitations where the user's email matches `invitee_email`.
+Shows invitations where the caller's `user_id` matches `invitee_user_id` OR their email matches `invitee_email`. `id` and `invitation_id` are the same value (kept duplicated for client backward compat). Past-expiry Pending rows are lazy-flipped to `Expired` on read.
+
+**Use cases:**
+- **Inbox** — call with `{include_resolved: false}` (or omit body) to show actionable Pending invites the caller can Accept / Decline.
+- **Received history page** — call with `{include_resolved: true}` to render the full timeline.
+</details>
+
+<details>
+<summary><b>POST /mobile/get-sent-invitations</b> — Outbox view: invitations the caller has sent</summary>
+
+**Body:** `{}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {invitations: [{id, invitation_id, device_id, device, invitee_user_id, invitee_email, role, status, note, sent_at, expires_at, invite_token, use_count, max_uses}, ...]}}` |
+
+Returns all invitations where `inviter_user_id == caller`, every status surfaced. The `invite_token` field lets the mobile app reconstruct the share link as `https://api.homedots.us/invite/<invite_token>` for the **Copy Link** action. Past-expiry Pending rows are lazy-flipped to `Expired` on read so the outbox stays consistent with the inbox state machine.
+
+Pair with `/mobile/cancel-invitation` (Revoke), `/mobile/update-invitation` (change role), and `/mobile/resend-invitation` (re-fire email + push) to wire the per-row actions on the Sent invitations page.
+</details>
+
+<details>
+<summary><b>POST /mobile/resend-invitation</b> — Re-fire email + push for a Pending invitation</summary>
+
+**Body:** `{invitation_id}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Invitation resent"}` |
+| Not the inviter | `401` | `{message: "Only the original inviter can resend this invitation"}` |
+| Not Pending | `400` | `{message: "Cannot resend invitation in '<status>' state"}` |
+| No email on invitation | `400` | `{message: "This invitation has no email to resend to"}` |
+| Unknown invitation_id | `404` | `{message: "Invitation not found"}` |
+
+No DB state change — `invite_token`, `expires_at`, and `status` are all preserved. The same email + push that fire on `/mobile/invite-user` are re-fired (push only delivers if the invitee has an account). Bouncing emails will bounce again; the caller-visible signal is the same as the original send.
 </details>
 
 <details>
@@ -885,6 +933,9 @@ Accepting creates a `UserDeviceRole` for the user. Sends push notification to th
 | Usage limit reached | `400` | `{message: "This invite link has reached its usage limit"}` |
 | Own invitation | `400` | `{message: "Cannot accept your own invitation"}` |
 | Already have access | `400` | `{message: "You already have access to this device"}` |
+| Not the targeted invitee (registered user only) | `401` | `{message: "This invitation is not for you"}` |
+
+**Email-lock behavior** (changed 2026-04-29): when the invite was sent to a specific `invitee_email`, the link is locked to that email **only if the invitee already had an account at invitation time** (i.e. `invitee_user_id` was resolved server-side at invite creation). For invitations sent to addresses that didn't yet have an account, the recipient may sign up under any email of their choice and still claim the link — the email lock doesn't apply because we never had a real identity to anchor it to. Hijack-prevention is preserved for the case that matters (locking a known account), and onboarding is unblocked for the case where it doesn't (the email itself was the only identity proof).
 </details>
 
 <details>

@@ -973,6 +973,26 @@ async function runPhaseUsers() {
     'backend', [200, 400, 404]
   );
 
+  // POST /mobile/get-sent-invitations
+  // Body: {}
+  // Auth: backend
+  // Outbox view — invitations the caller has sent (all statuses).
+  await runTest(
+    'POST /mobile/get-sent-invitations', '/mobile/get-sent-invitations',
+    {},
+    'backend', [200]
+  );
+
+  // POST /mobile/resend-invitation
+  // Body: { invitation_id }
+  // Auth: backend
+  // Re-fire email + push for a Pending invitation. Inviter-only. No DB change.
+  await runTest(
+    'POST /mobile/resend-invitation', '/mobile/resend-invitation',
+    { invitation_id: 99999 },
+    'backend', [200, 400, 404]
+  );
+
   // POST /mobile/request-device-access
   // Body: { user_name, device_mac, note }
   // Auth: backend
