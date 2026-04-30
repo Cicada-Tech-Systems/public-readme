@@ -900,7 +900,7 @@ async function runPhaseDevices() {
 
 // ------------------------------------------------------------------
 // PHASE 4: DEVICE USERS & INVITATIONS
-// Endpoints: get-device-users, invite-user, get-invitations,
+// Endpoints: get-device-users, invite-user, get-received-invitations,
 //            respond-invitation, update-device-user-role, remove-device-user,
 //            user-profile
 // ------------------------------------------------------------------
@@ -926,12 +926,12 @@ async function runPhaseUsers() {
     'backend', [200, 400, 404]
   );
 
-  // POST /mobile/get-invitations
-  // Body: { user_name }
+  // POST /mobile/get-received-invitations
+  // Body: {}
   // Auth: backend
   await runTest(
-    'POST /mobile/get-invitations', '/mobile/get-invitations',
-    { user_name: userName },
+    'POST /mobile/get-received-invitations', '/mobile/get-received-invitations',
+    {},
     'backend', [200]
   );
 

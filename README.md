@@ -53,7 +53,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/invite-user` | Allowed duplicate pending invitations for same email. Did not check if invitee already had access. | Rejects duplicate pending invitations (409). Rejects inviting users who already have access or are the device owner (409). Sets `invitee_user_id` when invitee has an account. | **Partial** — new 409 responses for duplicates |
 | `POST /mobile/update-device-user-role` | Silently returned 200 when trying to change owner's role (no rows updated). Returned 200 for non-existent target users. | Returns 400 `"Cannot change the device owner's role"`. Returns 404 `"Target user not found on this device"`. | **Partial** — new error responses |
 | `POST /mobile/get-device-users` (2026-04-29) | Pending invitations returned `id: null` when the invitee had no account, leaving the mobile app with no stable row key. | Each row now carries `invitation_id` alongside `id`. Pending rows have a non-null `invitation_id`; Active rows have `invitation_id: null`. | No — additive field |
-| `POST /mobile/get-invitations` (2026-04-29) | Returned only Pending received invitations. Response per row had `invitation_id, invited_by, device, role, status, invited_at`. | Now returns every status (Pending + Active + Declined + Expired + Revoked) — symmetric with `get-sent-invitations`. Mobile app filters client-side. Response gains `note`, `expires_at`, `invitee_email`. Body stays `{}`. | **Partial** — clients that assumed "everything I get back is actionable Pending" must filter by `status === 'Pending'`. Other status rows now appear in the result set. |
+| `POST /mobile/get-received-invitations` (renamed from `/mobile/get-invitations` on 2026-04-29) | Old path returned only Pending received invitations. Response per row had `invitation_id, invited_by, device, role, status, invited_at`. | New path returns every status (Pending + Active + Declined + Expired + Revoked) — symmetric with `get-sent-invitations`. Mobile app filters client-side. Response gains `note`, `expires_at`, `invitee_email`. Body stays `{}`. | **Yes** — endpoint path changed AND filter behavior changed. Update the URL to `/mobile/get-received-invitations` and filter by `status === 'Pending'` for the inbox view. The old `/mobile/get-invitations` path now returns 404. |
 | `POST /mobile/accept-invite-link` (2026-04-29) | A targeted invite (where `invitee_email` was set) could only be accepted by an account whose registered email matched. | The email lock is now only enforced when the invitee already had an account at invite time (`invitee_user_id` set). Targeted invites to unregistered emails accept under any email — the recipient may have signed up under a different one. | No — strictly more permissive |
 
 ### New Endpoints (not in previous version)
@@ -86,7 +86,7 @@ If your app was built against the previous API, review the items below. Items ma
 
 These endpoints work exactly as documented in the previous version:
 
-`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/pair-device`, `/mobile/get-alert-thresholds`, `/mobile/update-alert-thresholds`, `/mobile/get-invitations`, `/mobile/remove-device-user`
+`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/pair-device`, `/mobile/get-alert-thresholds`, `/mobile/update-alert-thresholds`, `/mobile/remove-device-user`
 
 ---
 
@@ -859,7 +859,7 @@ If `invitee_email` is provided: sends email + push notification to the invitee (
 </details>
 
 <details>
-<summary><b>POST /mobile/get-invitations</b> — List invitations received by the current user</summary>
+<summary><b>POST /mobile/get-received-invitations</b> — Inbox view: invitations received by the current user</summary>
 
 **Body:** `{}`
 
@@ -868,6 +868,8 @@ If `invitee_email` is provided: sends email + push notification to the invitee (
 | Success | `200` | `{data: {invitations: [{id, invitation_id, invited_by, device, role, status, note, invited_at, expires_at, invitee_email}, ...]}}` |
 
 Returns every status (Pending + Active + Declined + Expired + Revoked) for invitations where the caller's `user_id` matches `invitee_user_id` OR their email matches `invitee_email`. Symmetric with `get-sent-invitations` — the mobile app filters client-side (typical users have few enough rows that returning everything beats two endpoints). `id` and `invitation_id` are the same value (kept duplicated for client backward compat). Past-expiry Pending rows are lazy-flipped to `Expired` on read.
+
+**Renamed 2026-04-29:** previously `/mobile/get-invitations`. The old path now returns 404. Update mobile clients to use the new path.
 
 **Use cases:**
 - **Inbox view** — filter rows where `status === 'Pending'`.
