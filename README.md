@@ -55,6 +55,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/get-device-users` (2026-04-29) | Pending invitations returned `id: null` when the invitee had no account, leaving the mobile app with no stable row key. | Each row now carries `invitation_id` alongside `id`. Pending rows have a non-null `invitation_id`; Active rows have `invitation_id: null`. | No — additive field |
 | `POST /mobile/get-received-invitations` (renamed from `/mobile/get-invitations` on 2026-04-29) | Old path returned only Pending received invitations. Response per row had `invitation_id, invited_by, device, role, status, invited_at`. | New path returns every status (Pending + Active + Declined + Expired + Revoked) — symmetric with `get-sent-invitations`. Mobile app filters client-side. Response gains `note`, `expires_at`, `invitee_email`. Body stays `{}`. | **Yes** — endpoint path changed AND filter behavior changed. Update the URL to `/mobile/get-received-invitations` and filter by `status === 'Pending'` for the inbox view. The old `/mobile/get-invitations` path now returns 404. |
 | `POST /mobile/accept-invite-link` (2026-04-29) | A targeted invite (where `invitee_email` was set) could only be accepted by an account whose registered email matched. | The email lock is now only enforced when the invitee already had an account at invite time (`invitee_user_id` set). Targeted invites to unregistered emails accept under any email — the recipient may have signed up under a different one. | No — strictly more permissive |
+| `POST /mobile/remove-device-user`, `POST /mobile/update-device-user-role` (2026-04-30) | Body required exactly one of `target_user_id` or `target_email`. Pending invitations were targeted via the fuzzy `target_email` branch, which could match the wrong row when multiple Pending invitations existed for the same email + device. | Body now accepts a third option: `target_invitation_id`. Pass it for Pending rows (the value comes straight from `get-device-users`'s `invitation_id` field) for a deterministic single-row match. `target_user_id` is still preferred for Active users; `target_email` stays supported as a legacy fallback. The validator now requires **exactly one** of the three identifiers. | No — additive field |
 
 ### New Endpoints (not in previous version)
 
@@ -943,33 +944,44 @@ Accepting creates a `UserDeviceRole` for the user. Sends push notification to th
 <details>
 <summary><b>POST /mobile/remove-device-user</b> — Remove a user's device access</summary>
 
-**Body:** `{device_id, target_user_id?, target_email?}` — provide **exactly one** of `target_user_id` or `target_email`. Use `target_email` when revoking a pending invitation that was sent to an address with no registered account yet (`get-device-users` returns `user_id: null` for those rows — pass the row's `email` here instead). Otherwise pass `target_user_id`.
+**Body:** `{device_id, target_user_id?, target_email?, target_invitation_id?}` — provide **exactly one** target identifier:
+
+- `target_user_id` — for accepted users (rows with `status: "Active"` in `get-device-users`).
+- `target_invitation_id` — for Pending invitations. Deterministic single-row revoke — pass the `invitation_id` directly from `get-device-users`. Preferred over `target_email` when available.
+- `target_email` — legacy fuzzy match for Pending invitations. Use only if the client doesn't have `invitation_id` surfaced yet.
 
 | Response | Status | Body |
 |----------|--------|------|
 | Success | `200` | `{message: "User removed from device"}` |
-| Both/neither identifier given | `422` | `{message: "Provide exactly one of target_user_id or target_email"}` |
-| Not owner/manager | `403` | `{message: "Only device owners and managers can remove users"}` |
+| Wrong number of identifiers | `400` | `{message: "Provide exactly one of target_user_id, target_email, or target_invitation_id"}` |
+| Not owner/manager | `401` | `{message: "Only device owners and managers can remove users"}` |
 | Self-removal | `400` | `{message: "Cannot remove yourself from a device"}` |
 | Target is device owner | `400` | `{message: "Cannot remove the device owner; unclaim the device instead"}` |
+| Invitation not on this device | `404` | `{message: "Invitation not found on this device"}` |
 | Target not on device & no pending invite | `404` | `{message: "User is not a member of this device"}` |
 
-Removes the `user_device_roles` row (if any) and revokes any matching pending invitations. Push notification fires only when an actual role row was removed — pending-invite-only revocations are silent (no app to notify).
+For the `target_invitation_id` branch the invitation lookup filters by **both** `invitation_id` AND `device_id`. A manager on device A cannot revoke an invitation on device B by guessing IDs — the response is the same 404 as a non-existent ID, no enumeration leak. The manage-access gate fires before any invitation lookup, so non-managers cannot probe IDs at all.
+
+For the `target_user_id` branch: removes the `user_devices` row (if any) and revokes any matching pending invitations. Push notification fires only when an actual role row was removed — pending-invite-only revocations are silent (no app to notify).
 </details>
 
 <details>
 <summary><b>POST /mobile/update-device-user-role</b> — Change a user's role on a device</summary>
 
-**Body:** `{device_id, target_user_id?, target_email?, new_role: "manager"|"caregiver"|"viewer"}` — same `target_user_id` / `target_email` rule as `remove-device-user`. The `target_email` branch updates the role on a still-pending invitation, so the invitee comes in with the corrected role when they accept.
+**Body:** `{device_id, target_user_id?, target_email?, target_invitation_id?, new_role: "manager"|"caregiver"|"viewer"}` — same 3-way XOR target rule as `remove-device-user`. Use `target_invitation_id` for Pending rows so the role change lands on exactly that one invitation; `target_email` is the legacy fuzzy fallback.
 
 | Response | Status | Body |
 |----------|--------|------|
 | Success | `200` | `{message: "User role updated"}` |
-| Both/neither identifier given | `422` | `{message: "Provide exactly one of target_user_id or target_email"}` |
-| Not owner/manager | `403` | `{message: "Only device owners and managers can change roles"}` |
+| Wrong number of identifiers | `400` | `{message: "Provide exactly one of target_user_id, target_email, or target_invitation_id"}` |
+| Not owner/manager | `401` | `{message: "Only device owners and managers can change roles"}` |
 | Target is owner | `400` | `{message: "Cannot change the device owner's role"}` |
+| Invitation not on this device | `404` | `{message: "Invitation not found on this device"}` |
+| Invitation not Pending | `400` | `{message: "Cannot change role on an invitation in '<status>' state"}` |
 | Target not on device | `404` | `{message: "Target user not found on this device"}` |
 | Invalid role | `400` | `{message: "Invalid role. Must be one of: caregiver, manager, viewer"}` |
+
+Same security model as remove-device-user: invitation lookup is scoped to `device_id`, manage-access gate runs first.
 
 Owner AND manager roles can change non-owner roles (manager-OK policy). Owner's own role is immutable here — use `remove-device` to unclaim instead. Push notification fires only on role rows; pending-invite role changes are silent.
 </details>
