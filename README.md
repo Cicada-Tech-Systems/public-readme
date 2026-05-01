@@ -56,6 +56,8 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/get-received-invitations` (renamed from `/mobile/get-invitations` on 2026-04-29) | Old path returned only Pending received invitations. Response per row had `invitation_id, invited_by, device, role, status, invited_at`. | New path returns every status (Pending + Active + Declined + Expired + Revoked) — symmetric with `get-sent-invitations`. Mobile app filters client-side. Response gains `note`, `expires_at`, `invitee_email`. Body stays `{}`. | **Yes** — endpoint path changed AND filter behavior changed. Update the URL to `/mobile/get-received-invitations` and filter by `status === 'Pending'` for the inbox view. The old `/mobile/get-invitations` path now returns 404. |
 | `POST /mobile/accept-invite-link` (2026-04-29) | A targeted invite (where `invitee_email` was set) could only be accepted by an account whose registered email matched. | The email lock is now only enforced when the invitee already had an account at invite time (`invitee_user_id` set). Targeted invites to unregistered emails accept under any email — the recipient may have signed up under a different one. | No — strictly more permissive |
 | `POST /mobile/remove-device-user`, `POST /mobile/update-device-user-role` (2026-04-30) | Body required exactly one of `target_user_id` or `target_email`. Pending invitations were targeted via the fuzzy `target_email` branch, which could match the wrong row when multiple Pending invitations existed for the same email + device. | Body now accepts a third option: `target_invitation_id`. Pass it for Pending rows (the value comes straight from `get-device-users`'s `invitation_id` field) for a deterministic single-row match. `target_user_id` is still preferred for Active users; `target_email` stays supported as a legacy fallback. The validator now requires **exactly one** of the three identifiers. | No — additive field |
+| `POST /mobile/cancel-invitation`, `POST /mobile/update-invitation`, `POST /mobile/resend-invitation` (2026-04-30) | Auth required `inviter_user_id == caller`. Managers who didn't personally send an invite hit 401 even with full manage access on the device. | Auth now requires owner-or-manager on the invitation's device (not just the original inviter). Matches the auth model used by `remove-device-user` / `update-device-user-role`. Manage-access lookup uses `inv.device_id` so cross-device targeting is still blocked. | No — strictly more permissive. Error message changed from "Only the original inviter can …" to "Only device owners and managers can …" |
+| `POST /mobile/resend-invitation` (2026-04-30) | Rejected `Expired` invitations with 400. | Now accepts `Expired` and resurrects them: status flips back to `Pending`, `expires_at` bumped +7 days. Active/Declined/Revoked still rejected. | No — strictly more permissive |
 
 ### New Endpoints (not in previous version)
 
@@ -75,7 +77,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/notifications/unregister` | Remove FCM token on logout | When implementing push |
 | `POST /mobile/user-profile` | User details + associated devices. Optional `target_user_id` to view another user (must share a device). | For user profile and "view user details" in device user list |
 | `POST /mobile/get-sent-invitations` (2026-04-29) | Outbox view — invitations the caller has sent. Returns all statuses (Pending/Active/Declined/Expired/Revoked) with `invite_token` for the copy-link UI action, plus `note`, `sent_at`, `expires_at`, `use_count`, `max_uses`. | When adding a "Sent" tab to the invitations page |
-| `POST /mobile/resend-invitation` (2026-04-29) | Re-fires the invite email + push for a Pending invitation. Caller must be the original inviter. No DB state change (token, expiry, status preserved). | When adding a "Resend" button to the Sent invitations page |
+| `POST /mobile/resend-invitation` (2026-04-29, expanded 2026-04-30) | Re-fires the invite email + push for a Pending or Expired invitation. Caller must be an owner or manager on the invitation's device (no longer inviter-only). For Pending invites, no DB change. For Expired invites, the row is resurrected: `status` flips back to `Pending` and `expires_at` is bumped 7 days forward (same `invite_token`/`role`/`note`). | When adding a "Resend" button to the Sent invitations page |
 
 ### Removed Endpoints
 
@@ -892,19 +894,25 @@ Pair with `/mobile/cancel-invitation` (Revoke), `/mobile/update-invitation` (cha
 </details>
 
 <details>
-<summary><b>POST /mobile/resend-invitation</b> — Re-fire email + push for a Pending invitation</summary>
+<summary><b>POST /mobile/resend-invitation</b> — Re-fire email + push for a Pending or Expired invitation</summary>
 
 **Body:** `{invitation_id}`
 
 | Response | Status | Body |
 |----------|--------|------|
 | Success | `200` | `{message: "Invitation resent"}` |
-| Not the inviter | `401` | `{message: "Only the original inviter can resend this invitation"}` |
-| Not Pending | `400` | `{message: "Cannot resend invitation in '<status>' state"}` |
+| Not owner/manager | `401` | `{message: "Only device owners and managers can resend invitations"}` |
+| Active/Declined/Revoked | `400` | `{message: "Cannot resend invitation in '<status>' state"}` |
 | No email on invitation | `400` | `{message: "This invitation has no email to resend to"}` |
 | Unknown invitation_id | `404` | `{message: "Invitation not found"}` |
 
-No DB state change — `invite_token`, `expires_at`, and `status` are all preserved. The same email + push that fire on `/mobile/invite-user` are re-fired (push only delivers if the invitee has an account). Bouncing emails will bounce again; the caller-visible signal is the same as the original send.
+For **Pending** invitations: no DB state change — `invite_token`, `expires_at`, `status` all preserved. Email + push are re-fired.
+
+For **Expired** invitations (added 2026-04-30): the row is resurrected. `status` flips back to `Pending`, `expires_at` is bumped to **now + 7 days**. The `invite_token`, `role`, `note`, and `invitee_email` are preserved — same row in the outbox just comes back to life. Then email + push fire as for Pending.
+
+`Active` (already accepted), `Declined`, and `Revoked` are deliberate end states and remain rejected — to invite that user again, send a fresh `/mobile/invite-user`.
+
+Auth: any owner or manager on the invitation's device may resend (not just the original inviter). Push only delivers if the invitee has an account.
 </details>
 
 <details>
