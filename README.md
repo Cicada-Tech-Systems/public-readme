@@ -1038,30 +1038,86 @@ With `target_user_id`, returns that user's profile — but only devices that bot
 </details>
 
 <details>
-<summary><b>POST /mobile/notifications/preferences</b> — Update notification preferences (JWT auth)</summary>
+<summary><b>POST /mobile/notifications/preferences</b> — Get or update notification preferences (JWT auth)</summary>
 
-**Body:** `{push_enabled?: bool, email_enabled?: bool}`
+**Body:** `{push_enabled?: bool, email_enabled?: bool, events?: {<category>: {push?: bool, email?: bool}}}`
 
-| Response | Status | Body |
-|----------|--------|------|
-| Success | `200` | `{data: {push_enabled: true, email_enabled: false}}` |
-
-Send only fields to change. Returns current state after update.
-</details>
-
-<details>
-<summary><b>POST /mobile/notifications/preferences</b> — Get notification preferences (JWT auth)</summary>
-
-**Body:** `{}` (empty body to read current state)
+Empty body returns the current preferences without modifying. Sending any field updates only that field; unset fields are preserved.
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {push_enabled: true, email_enabled: true}}` |
+| Success | `200` | `{data: {push_enabled, email_enabled, events: {...}}}` |
 
-Send empty body to read. Send `{push_enabled, email_enabled}` to update. Defaults to both enabled if user hasn't set preferences.
+**Effective send rule** for each notification:
+
+```
+master_enabled[channel] AND events[event_category].get(channel, default=true)
+```
+
+Master toggles (`push_enabled`, `email_enabled`) act as kill-switches for the entire channel. Per-event toggles in `events` further refine which categories fire on each channel within an enabled channel. Empty/missing `events` map = "all events on" (default for new users).
+
+**Event categories** (returned in every GET response with defaults `{push: true, email: true}` if not yet set):
+
+| Category | Fires for |
+|---|---|
+| `alerts` | Vital threshold breaches + escalations + alert resolution |
+| `invitations` | You've been invited to a device |
+| `invitation_responses` | Your invitee accepted or declined your invite |
+| `access_requests` | Someone requested view access to your device |
+| `device_changes` | Your role on a device changed; you were removed from a device |
+
+Unknown event categories sent in the request are silently ignored (forward-compatible — server can add new categories without breaking older clients).
+
+**Examples:**
+
+```json
+// Read current prefs
+{}
+
+// Disable email entirely (kill-switch)
+{"email_enabled": false}
+
+// Get alerts via push+email but device_changes only via push
+{"events": {
+  "alerts":          {"push": true, "email": true},
+  "device_changes":  {"push": true, "email": false}
+}}
+
+// Sample response shape
+{"data": {
+  "push_enabled": true,
+  "email_enabled": true,
+  "events": {
+    "alerts":              {"push": true, "email": true},
+    "invitations":         {"push": true, "email": true},
+    "invitation_responses":{"push": true, "email": true},
+    "access_requests":     {"push": true, "email": true},
+    "device_changes":      {"push": true, "email": false}
+  }
+}}
+```
+
+Partial updates merge — sending `{events: {alerts: {email: false}}}` only changes `events.alerts.email`; other categories and other fields stay as previously stored. Old clients sending only `{push_enabled, email_enabled}` continue to work; their stored `event_prefs` is preserved.
+
+**Defaults for users who have never set preferences:** all categories on for both channels.
 </details>
 
-**Push notifications sent for:** alert triggers, alert escalations, invitation received, invitation accepted/declined, access request received, role changed, user removed from device.
+**Push + email sent for:** alert triggers (push + email per severity routing), alert escalations, alert resolution (push only), invitation received (push only — the initial invite-user flow already sends an email with the deep link), invitation accepted/declined (push + email), access request received (push + email), role changed (push + email), user removed from device (push + email). All channels gated by per-user, per-event preferences.
+
+### Push notification data payload
+
+Each push includes a `data` field your mobile app can branch on for routing:
+
+| `data.type` | Sent when | Extra fields |
+|---|---|---|
+| `invitation` | You're invited to a device | — |
+| `invitation_response` | Your invitee acted on your invite | — |
+| `access_request` | Someone wants access to your device | — |
+| `role_changed` | A manager changed your role | — |
+| `access_removed` | You were removed from a device | — |
+| `alert_resolved` | An alert on a device you watch was resolved | `device_mac` |
+
+Plus the alert-trigger pushes (from `NotificationDispatcher`) carry `alert_id` and `device_mac` in `data` so the app can deep-link to the alert detail screen.
 
 ---
 
