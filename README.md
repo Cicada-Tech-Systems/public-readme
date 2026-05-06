@@ -35,6 +35,8 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/get-groups` | Device/group fields: `id`, `name`, `mac_address` | Returns ONLY new names: `device_id`, `device_description`, `device_mac`, `group_id`, `group_name`. The legacy duplicate aliases were removed in the 2026-04-24 release. | **Yes** — clients still reading `id`/`name`/`mac_address` must switch to the new names |
 | `POST /mobile/get-devices-with-alerts` | Response had `id`, `name`, `alertCount` | Returns BOTH old AND new field names (`device_id`, `device_description`, `alert_count`) | No |
 | `POST /mobile/get-alerts-by-device` | Response had `id`, `current`, `threshold`, `alertStatus` | Returns BOTH old AND new field names (`alert_id`, `current_value`, `threshold_value`, `alert_status`) plus new `status`, `severity`, `acknowledged_at` | No |
+| `POST /mobile/get-alerts-by-device` (2026-05-04) | Response only carried alert-row fields. Mobile had to make a separate call to learn which device_name to render in the header and whether the caller could ack/dismiss. Per-alert `severity` and lifecycle `status` were dropped at the router even though the model populated them. | Top-level `device_name` and `user_role` (`owner`/`manager`/`caregiver`/`viewer`) are now in the response payload alongside `alerts`. Each alert dict now also surfaces `severity` (`critical`/`warning`/`info`) and `status` (`triggered`/`acknowledged`/`resolved`). Viewers continue to see alerts but server still rejects ack/resolve from them — mobile should hide those buttons when `user_role === 'viewer'`. | No — additive |
+| Alert title format (2026-05-04) | Title was `"{measurement} {direction} threshold: {value} {op} {threshold}"`, e.g. `"respiratoryrate below threshold: 9.4 < 10.000"`. Squashed column name and Numeric trailing zeros leaked into the UI and push body. | Concise label form: `"Low Respiratory Rate"` / `"High Heart Rate"` / `"High Systolic Blood Pressure"`, etc. Current/threshold values were already on the alert card and in the response, so the title no longer repeats them. | No — historical alerts keep their old title text; new ones use the new form |
 | `POST /mobile/invite-user` | Required `invitee_email`. Returned `{invitation_id}` | `invitee_email` optional. Returns `{invitation_id, invite_token}`. Sends push notification | **Yes** — role must be `"manager"` not `"co-owner"` |
 | `POST /mobile/delete-group` | Moved devices to default group | Devices move to "Ungrouped Devices" system group. Cannot delete the system group itself (400). | No |
 | `POST /mobile/rename-group` | No restrictions | Cannot rename "Ungrouped Devices" system group (400) | **Partial** — handle 400 for default group |
@@ -749,11 +751,15 @@ Each device includes both old field names (`id`, `name`, `alertCount`) and new n
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {alerts: [{alert_id, title, current_value, threshold_value, unit, alert_status, status, severity, resolved_at, acknowledged_at, created_at}, ...]}}` |
+| Success | `200` | `{data: {alerts: [{alert_id, title, current_value, threshold_value, unit, alert_status, status, severity, resolved_at, acknowledged_at, created_at}, ...], device_name, user_role}}` |
 | No access | `401` | `{message: "No access to this device"}` |
 | Device not found | `404` | `{message: "Device not found"}` |
 
 `alert_status` is the legacy field (`"High"`, `"Medium"`, `"Low"`). `status` is the new lifecycle field (`"triggered"`, `"acknowledged"`, `"resolved"`). `severity` is the new severity (`"critical"`, `"warning"`, `"info"`).
+
+`device_name` is the human-readable device label — useful when the user navigated in from a push notification that only carried `device_mac`. `user_role` is the caller's role on this device (`owner`, `manager`, `caregiver`, `viewer`); the mobile UI should hide the **Acknowledge** and **Resolve** buttons when it equals `"viewer"` since the server will reject those calls with 403/401.
+
+**Title format (2026-05-04):** alerts created from this date onward use a concise label like `"Low Respiratory Rate"` or `"High Heart Rate"`. Current and threshold values are already in dedicated fields, so the title is just a label. Older alerts keep their previous `"{measurement} {direction} threshold: …"` text.
 </details>
 
 <details>
@@ -1117,7 +1123,7 @@ Each push includes a `data` field your mobile app can branch on for routing:
 | `access_removed` | You were removed from a device | — |
 | `alert_resolved` | An alert on a device you watch was resolved | `device_mac` |
 
-Plus the alert-trigger pushes (from `NotificationDispatcher`) carry `alert_id` and `device_mac` in `data` so the app can deep-link to the alert detail screen.
+Plus the alert-trigger pushes (from `NotificationDispatcher`) carry `alert_id`, `device_mac`, and `device_name` in `data` so the app can render a friendly header and deep-link to the alert detail screen even before the API roundtrip returns. The push **body** also leads with the device name, e.g. `"Living Room BedDot: Low Respiratory Rate"`. The same `device_name` is threaded into the alert email — the email subject reads `HomeDots [WARNING] — Living Room BedDot — Low Respiratory Rate` and the device card shows the friendly name on top with the MAC underneath.
 
 ---
 
