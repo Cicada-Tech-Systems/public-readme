@@ -37,6 +37,11 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/get-alerts-by-device` | Response had `id`, `current`, `threshold`, `alertStatus` | Returns BOTH old AND new field names (`alert_id`, `current_value`, `threshold_value`, `alert_status`) plus new `status`, `severity`, `acknowledged_at` | No |
 | `POST /mobile/get-alerts-by-device` (2026-05-04) | Response only carried alert-row fields. Mobile had to make a separate call to learn which device_name to render in the header and whether the caller could ack/dismiss. Per-alert `severity` and lifecycle `status` were dropped at the router even though the model populated them. | Top-level `device_name` and `user_role` (`owner`/`manager`/`caregiver`/`viewer`) are now in the response payload alongside `alerts`. Each alert dict now also surfaces `severity` (`critical`/`warning`/`info`) and `status` (`triggered`/`acknowledged`/`resolved`). Viewers continue to see alerts but server still rejects ack/resolve from them — mobile should hide those buttons when `user_role === 'viewer'`. | No — additive |
 | Alert title format (2026-05-04) | Title was `"{measurement} {direction} threshold: {value} {op} {threshold}"`, e.g. `"respiratoryrate below threshold: 9.4 < 10.000"`. Squashed column name and Numeric trailing zeros leaked into the UI and push body. | Concise label form: `"Low Respiratory Rate"` / `"High Heart Rate"` / `"High Systolic Blood Pressure"`, etc. Current/threshold values were already on the alert card and in the response, so the title no longer repeats them. | No — historical alerts keep their old title text; new ones use the new form |
+| `POST /mobile/get-alert-thresholds` (2026-05-08) | Response was `{thresholds: {hr: {min, max}, rr: {min, max}, bph: {min, max}, bpl: {min, max}, oc: {on, off}}}` — short codes, no per-measurement enabled flag. Backed by a `device.alert_setting` JSON column the threshold checker never read from. | Response is now `{thresholds: {measurement: {min, max, enabled}}}` keyed by full measurement names (`heartrate`, `respiratoryrate`, `systolic`, `diastolic`, plus any future vitals like `spo2`/`temperature`). Reads from the `alert_rules` table — same source the server uses to actually fire alerts. Each entry carries an `enabled` boolean so the UI can render the toggle in its current state. | **Yes** — clients reading `hr.max` etc. must switch to `heartrate.max` etc. |
+| `POST /mobile/update-alert-thresholds` (2026-05-08) | Wrote the JSON body verbatim into `device.alert_setting`. **Never updated `alert_rules`**, so user-customized thresholds were silently ignored by the threshold checker — every device alerted on the seeded defaults regardless of what the mobile app saved. | Now reconciles directly into `alert_rules`. Payload shape unchanged: `{thresholds: {measurement: {min, max}}}`. Semantics: keys present → upserted with `enabled=True`; keys absent → existing rules flipped to `enabled=False` (this is how the UI says "disable just respiratory rate"); empty `{}` → every rule disabled (master off). Threshold values are preserved on disable so re-enabling later doesn't require re-entering ranges. | No — bulk shape unchanged. New per-rule + per-device toggle endpoints below offer cleaner alternatives. |
+| `POST /mobile/resolve-alert` (2026-05-07) | Set `resolved_at` but left `status` at `acknowledged`/`triggered`. The next `/get-alerts-by-device` call returned a populated `resolved_at` alongside `status: "acknowledged"` — inconsistent state visible to mobile. | Now flips `status` to `"resolved"` along with `resolved_at`. Both fields move together. | No — bug fix |
+| `POST /mobile/remove-device-user` (2026-05-08) | Deleted the `UserDevice` row but left dangling `DeviceGroupMember` rows under the removed user's groups. The device kept appearing in `/mobile/get-groups` for the removed user (with a fake `viewer` role) even though every access-checking endpoint correctly returned 'No access'. | Also deletes the matching group-member rows. `/mobile/get-groups` no longer ghost-renders revoked devices. Defense in depth: `get-groups` now INNER JOINs `user_devices` so even unforeseen drift can't surface unauthorized rows. | No — bug fix |
+| `POST /mobile/remove-device` (2026-05-08) | Unclaiming a device deleted role rows + group memberships but left outstanding `user_invitations` Pending. Privilege escalation risk: an old invite link could be redeemed AFTER a different user re-claimed the same device, granting the original invitee access to the new owner's device. | Now flips every Pending/Active invitation on the device to `Revoked` as part of unclaim. `accept_invite_token` rejects them at redemption time. Migration 012 backfilled 4 existing orphans on prod. | No — security fix |
 | `POST /mobile/invite-user` | Required `invitee_email`. Returned `{invitation_id}` | `invitee_email` optional. Returns `{invitation_id, invite_token}`. Sends push notification | **Yes** — role must be `"manager"` not `"co-owner"` |
 | `POST /mobile/delete-group` | Moved devices to default group | Devices move to "Ungrouped Devices" system group. Cannot delete the system group itself (400). | No |
 | `POST /mobile/rename-group` | No restrictions | Cannot rename "Ungrouped Devices" system group (400) | **Partial** — handle 400 for default group |
@@ -80,6 +85,9 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/user-profile` | User details + associated devices. Optional `target_user_id` to view another user (must share a device). | For user profile and "view user details" in device user list |
 | `POST /mobile/get-sent-invitations` (2026-04-29) | Outbox view — invitations the caller has sent. Returns all statuses (Pending/Active/Declined/Expired/Revoked) with `invite_token` for the copy-link UI action, plus `note`, `sent_at`, `expires_at`, `use_count`, `max_uses`. | When adding a "Sent" tab to the invitations page |
 | `POST /mobile/resend-invitation` (2026-04-29, expanded 2026-04-30) | Re-fires the invite email + push for a Pending or Expired invitation. Caller must be an owner or manager on the invitation's device (no longer inviter-only). For Pending invites, no DB change. For Expired invites, the row is resurrected: `status` flips back to `Pending` and `expires_at` is bumped 7 days forward (same `invite_token`/`role`/`note`). | When adding a "Resend" button to the Sent invitations page |
+| `POST /mobile/set-alert-rule` (2026-05-08) | Upsert one measurement's threshold range. Body: `{device_mac, measurement, min, max}` (min/max nullable for one-sided rules like "alert only when temp goes above 38"). Always sets `enabled=True`. Doesn't touch other measurements. Owner/manager only. | When the threshold-edit UI changes a single vital — smaller payload than `update-alert-thresholds` and explicit "I'm editing the range" intent. |
+| `POST /mobile/toggle-alert-rule` (2026-05-08) | Enable/disable one measurement's rule without touching its threshold values. Body: `{device_mac, measurement, enabled}`. Toggling off then back on preserves the user's saved `min`/`max` so the chart can keep showing them while alerts are off. Owner/manager only. | When the per-vital alert-on/off switch is toggled. |
+| `POST /mobile/toggle-device-alerts` (2026-05-08) | Master switch for a device — flips `enabled` on every rule for that device. Body: `{device_mac, enabled}`. Threshold values preserved on every row. Owner/manager only. | When the user toggles the device-level "Alerts" switch on the device settings screen. |
 
 ### Removed Endpoints
 
@@ -91,7 +99,7 @@ If your app was built against the previous API, review the items below. Items ma
 
 These endpoints work exactly as documented in the previous version:
 
-`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/pair-device`, `/mobile/get-alert-thresholds`, `/mobile/update-alert-thresholds`, `/mobile/remove-device-user`
+`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/pair-device`
 
 ---
 
@@ -769,21 +777,76 @@ Each device includes both old field names (`id`, `name`, `alertCount`) and new n
 
 | Response | Status | Body |
 |----------|--------|------|
-| Success | `200` | `{data: {thresholds: {heartrate: {min: 50, max: 120}, respiratoryrate: {min: 8, max: 25}, ...}}}` |
-| No thresholds set | `200` | `{data: {thresholds: {}}}` |
+| Success | `200` | `{data: {thresholds: {heartrate: {min: 45, max: 120, enabled: true}, respiratoryrate: {min: 10, max: 22, enabled: false}, ...}}}` |
+| No rules configured | `200` | `{data: {thresholds: {}}}` |
 | No access | `404` | `{message: "Device not found or no access"}` |
+
+Reads from `alert_rules` (the source of truth for threshold checks). Each entry carries `enabled` so the mobile UI knows whether the toggle is on. Disabled rules are still returned with their last-saved `min`/`max` so the chart can show them while alerts are off. `min` and `max` may be `null` for one-sided rules.
+
+**Future-proofing:** measurement keys are not enumerated server-side. New vital types (e.g. `spo2`, `temperature`) will appear in this response automatically as soon as they're written via `/mobile/set-alert-rule` or seeded by the device service.
 </details>
 
 <details>
-<summary><b>POST /mobile/update-alert-thresholds</b> — Set alert thresholds</summary>
+<summary><b>POST /mobile/update-alert-thresholds</b> — Bulk-replace alert thresholds</summary>
 
-**Body:** `{user_name, device_mac, thresholds: {heartrate: {min: 50, max: 120}, ...}}`
+**Body:** `{user_name, device_mac, thresholds: {heartrate: {min: 45, max: 120}, ...}}`
 
 | Response | Status | Body |
 |----------|--------|------|
 | Success | `200` | `{message: "Thresholds updated"}` |
 | Not owner/manager | `403` | `{message: "Only device owners and managers can update thresholds"}` |
 | Invalid JSON | `400` | `{message: "Thresholds must be a JSON object"}` |
+
+Reconciles directly into `alert_rules`. Treat the dict as the **complete desired state** of the device's alerts:
+
+- Keys present → upserted with `enabled=true`
+- Keys absent → matching rules flipped to `enabled=false` (this is how the UI says "disable just respiratory rate")
+- Empty `{}` → every rule on the device disabled (master off). Threshold values are **not erased** — re-enabling later doesn't need a re-entry.
+
+Use the bulk path when the user hits "Save" on a multi-vital config screen. For single-vital edits or toggles, prefer the fine-grained endpoints below.
+</details>
+
+<details>
+<summary><b>POST /mobile/set-alert-rule</b> — Edit one measurement's range (2026-05-08)</summary>
+
+**Body:** `{user_name, device_mac, measurement, min?, max?}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Alert rule updated"}` |
+| Not owner/manager | `403` | `{message: "Only device owners and managers can update alerts"}` |
+| Missing measurement | `400` | `{message: "measurement is required"}` |
+
+Upserts a single per-measurement rule with `enabled=true`. Other measurements untouched. `min` and `max` are independently nullable — passing `min=null, max=38` creates a "high-only" rule (alert when value goes above 38, no low bound).
+
+`measurement` is a free-form string; sending a new vital name (`"spo2"`, `"temperature"`, …) creates a fresh rule. No backend change needed for new vital types.
+</details>
+
+<details>
+<summary><b>POST /mobile/toggle-alert-rule</b> — Enable/disable one measurement (2026-05-08)</summary>
+
+**Body:** `{user_name, device_mac, measurement, enabled}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Alert rule toggled"}` |
+| Not owner/manager | `403` | `{message: "Only device owners and managers can update alerts"}` |
+| Unknown measurement | `404` | `{message: "No alert rule for measurement '..."}` |
+
+**Threshold values are NOT touched** — explicit non-destruction. Toggling off then back on returns to the user's last-saved range. Use this when a per-vital switch flips, not when the user is editing the bounds.
+</details>
+
+<details>
+<summary><b>POST /mobile/toggle-device-alerts</b> — Master switch for the whole device (2026-05-08)</summary>
+
+**Body:** `{user_name, device_mac, enabled}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Device alerts toggled"}` |
+| Not owner/manager | `403` | `{message: "Only device owners and managers can update alerts"}` |
+
+Flips `enabled` on every rule for the device in one call. Threshold values preserved on every row.
 </details>
 
 <details>
