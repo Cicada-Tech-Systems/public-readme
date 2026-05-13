@@ -42,7 +42,8 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/resolve-alert` (2026-05-07) | Set `resolved_at` but left `status` at `acknowledged`/`triggered`. The next `/get-alerts-by-device` call returned a populated `resolved_at` alongside `status: "acknowledged"` — inconsistent state visible to mobile. | Now flips `status` to `"resolved"` along with `resolved_at`. Both fields move together. | No — bug fix |
 | `POST /mobile/remove-device-user` (2026-05-08) | Deleted the `UserDevice` row but left dangling `DeviceGroupMember` rows under the removed user's groups. The device kept appearing in `/mobile/get-groups` for the removed user (with a fake `viewer` role) even though every access-checking endpoint correctly returned 'No access'. | Also deletes the matching group-member rows. `/mobile/get-groups` no longer ghost-renders revoked devices. Defense in depth: `get-groups` now INNER JOINs `user_devices` so even unforeseen drift can't surface unauthorized rows. | No — bug fix |
 | `POST /mobile/remove-device` (2026-05-08) | Unclaiming a device deleted role rows + group memberships but left outstanding `user_invitations` Pending. Privilege escalation risk: an old invite link could be redeemed AFTER a different user re-claimed the same device, granting the original invitee access to the new owner's device. | Now flips every Pending/Active invitation on the device to `Revoked` as part of unclaim. `accept_invite_token` rejects them at redemption time. Migration 012 backfilled 4 existing orphans on prod. | No — security fix |
-| `POST /mobile/get-groups` (2026-05-13) | Each device row carried `device_id`, `device_description`, `device_mac`, `last_seen_raw`, `activity_status` (`"active"`/`"inactive"`/`"unknown"`), and `role`. Stats-card filters had no signal for "is this device currently transmitting" without parsing a string, and no signal at all for "does this device have an active alert" without a separate API call. The per-vital current/threshold data lived in a different endpoint, requiring two round-trips for the dashboard. | Each device row now also carries: `is_active` (boolean — true when `last_seen_result` is within 5 minutes), `has_active_alert` (boolean — any unresolved alert on the device), and a nested `vitals` block keyed by `heart_rate` / `respiratory_rate` / `systolic` / `diastolic`. Each vital entry exposes `{current, min, max, enabled, has_active_alert}`. `current` is masked to `null` when the device is off-bed (mirrors `/mobile/get-latest-vitals`); `min`/`max`/`enabled` come straight from `alert_rules` so the stats card can render the toggle and bounds without an extra `get-alert-thresholds` call. | No — additive |
+| `POST /mobile/get-groups` (2026-05-13) | Each device row carried `device_id`, `device_description`, `device_mac`, `last_seen_raw`, `activity_status`, and `role`. Stats-card filters had no signal for "does this device have an active alert", and the per-vital current/threshold data lived in a different endpoint, requiring two round-trips. | Each device row now also carries `has_active_alert` (boolean — any unresolved alert on the device) plus four top-level vital blocks keyed by `heart_rate` / `respiration_rate` / `systolic` / `diastolic`. Each block is shaped `{current, min, max}` per the `GetDeviceGroupsResponseType` mobile contract — `current` is the latest reading (null when off-bed or no data), `min`/`max` come from `alert_rules` (null when no rule or rule disabled). | No — additive |
+| `POST /mobile/get-devices-with-alerts` (2026-05-13) | Returned `device_id`/`id`, `device_mac`, `name`/`device_description`, `role`, `alert_count`/`alertCount`, `last_seen_result`. No vitals — dashboards had to call `/mobile/get-latest-vitals` separately just to render the stats card. | Same shape plus four flat vital scalars (`heart_rate`, `respiration_rate`, `systolic`, `diastolic` — each a `number \| null` carrying the latest reading), `has_active_alert`, and `created_at` / `updated_at` timestamps. Off-bed masking applies (medical vitals null when occupancy < 0.5). Matches the `GetDevicesWithAlertsResponseType` mobile contract. | No — additive |
 | `POST /mobile/invite-user` | Required `invitee_email`. Returned `{invitation_id}` | `invitee_email` optional. Returns `{invitation_id, invite_token}`. Sends push notification | **Yes** — role must be `"manager"` not `"co-owner"` |
 | `POST /mobile/delete-group` | Moved devices to default group | Devices move to "Ungrouped Devices" system group. Cannot delete the system group itself (400). | No |
 | `POST /mobile/rename-group` | No restrictions | Cannot rename "Ungrouped Devices" system group (400) | **Partial** — handle 400 for default group |
@@ -583,7 +584,7 @@ Set `delete_vitals: true` to also permanently erase all vital history from Influ
 
 **Body:** `{user_name}`
 
-**Response shape** (`200`):
+**Response shape** (`200`) — matches the mobile `GetDeviceGroupsResponseType` TypeScript contract:
 
 ```jsonc
 {
@@ -600,16 +601,14 @@ Set `delete_vitals: true` to also permanently erase all vital history from Influ
             "device_description": "Bedroom BedDot",
             "device_mac": "aa:bb:cc:dd:ee:01",
             "last_seen_raw": "2026-05-13 09:42:01",
-            "activity_status": "active",   // legacy string — "active" | "inactive" | "unknown"
-            "is_active": true,              // 2026-05-13: boolean form, for stats-card filters
-            "role": "owner",                // owner | manager | caregiver | viewer
-            "has_active_alert": false,      // 2026-05-13: any unresolved alert on this device
-            "vitals": {                     // 2026-05-13: per-vital current + thresholds + state
-              "heart_rate":       {"current": 72,  "min": 45, "max": 120, "enabled": true,  "has_active_alert": false},
-              "respiratory_rate": {"current": 16,  "min": 10, "max": 22,  "enabled": true,  "has_active_alert": false},
-              "systolic":         {"current": null, "min": 90, "max": 140, "enabled": false, "has_active_alert": false},
-              "diastolic":        {"current": null, "min": 60, "max": 90,  "enabled": false, "has_active_alert": false}
-            }
+            "activity_status": "active",        // "active" | "inactive" | "unknown"
+            "occupied_status": "unknown",
+            "role": "owner",                    // owner | manager | caregiver | viewer
+            "has_active_alert": false,          // 2026-05-13
+            "heart_rate":       {"current": 72,   "min": 45, "max": 120},  // 2026-05-13
+            "respiration_rate": {"current": 16,   "min": 10, "max": 22},   // 2026-05-13
+            "systolic":         {"current": null, "min": 90, "max": 140},  // 2026-05-13
+            "diastolic":        {"current": null, "min": 60, "max": 90}    // 2026-05-13
           }
         ]
       }
@@ -619,19 +618,14 @@ Set `delete_vitals: true` to also permanently erase all vital history from Influ
 }
 ```
 
-**Device-level fields (2026-05-13 additions):**
+**2026-05-13 additions:**
 
-- `is_active` — `true` when `last_seen_result` is within the last 5 minutes. Use this instead of parsing the legacy `activity_status` string when filtering stats cards.
 - `has_active_alert` — `true` when any `alert_history` row for this device is still unresolved (`status` in `triggered` / `acknowledged`). Drives the red badge on the stats card.
+- `heart_rate` / `respiration_rate` / `systolic` / `diastolic` — flat top-level fields on the device, each shaped `{current, min, max}`. All four are always present, even on devices with no configured rules or no recent data.
+  - `current` — latest reading from the TimescaleDB hypertable (1-hour lookback). `null` when the device is off-bed (`occupancy < 0.5`) or has no data in the window. Off-bed masking matches `/mobile/get-latest-vitals`.
+  - `min` / `max` — configured thresholds from `alert_rules`. `null` when no rule exists OR the rule is disabled — mobile treats both as "no active alert config" at this layer. To get the explicit `enabled` flag per vital, hit `/mobile/get-alert-thresholds`.
 
-**Per-vital block (2026-05-13):** the four standard vitals are always present, even on devices with no configured rules or no recent data. Inside each entry:
-
-- `current` — latest reading from the TimescaleDB hypertable (1-hour lookback). `null` when the device is off-bed (`occupancy < 0.5`) or has no data in the window. Off-bed masking matches `/mobile/get-latest-vitals`.
-- `min` / `max` — configured thresholds from `alert_rules`. `null` when no rule exists for this measurement on this device.
-- `enabled` — `true` when the user has alerts enabled for this measurement. `false` when the rule is absent or toggled off.
-- `has_active_alert` — `true` when this specific measurement has at least one unresolved alert row.
-
-The vitals block is computed in one batch pass per response (3 queries total regardless of device count), so adding many devices to many groups doesn't multiply query load.
+The vitals + alert state is computed in one batch pass per response (3 queries total regardless of device count), so adding many devices to many groups doesn't multiply query load.
 
 **Group structure:** every device belongs to a group. The "Ungrouped Devices" group (`is_default: true`) is auto-created and cannot be renamed, deleted, or have devices removed from it. When a device is removed from another group, it moves to this group automatically. `ungrouped_devices` is always `[]` (kept for backward compatibility). The default group sorts first.
 
@@ -792,11 +786,42 @@ Require **backend auth** + `user_name` in body.
 
 **Body:** `{user_name}`
 
-| Response | Status | Body |
-|----------|--------|------|
-| Success | `200` | `{data: {devices: [{device_id, device_mac, device_description, alert_count, role, ...}]}}` |
+**Response shape** (`200`) — matches the mobile `GetDevicesWithAlertsResponseType` contract:
 
-Each device includes both old field names (`id`, `name`, `alertCount`) and new names (`device_id`, `device_description`, `alert_count`).
+```jsonc
+{
+  "data": {
+    "devices": [
+      {
+        "device_id": 13,
+        "id": 13,                                  // legacy alias of device_id
+        "device_mac": "aa:bb:cc:dd:ee:01",
+        "device_description": "Bedroom BedDot",
+        "name": "Bedroom BedDot",                   // legacy alias of device_description
+        "created_at": "2026-04-12 09:00:00",
+        "updated_at": "2026-05-13 09:42:01",        // 2026-05-13: maps to last_seen_result
+        "last_seen_result": "2026-05-13 09:42:01",  // kept for older clients
+        "role": "owner",
+        "alert_count": 3,
+        "alertCount": 3,                            // legacy alias of alert_count
+        "has_active_alert": true,                   // 2026-05-13
+        "heart_rate": 92.5,                          // 2026-05-13: latest reading, scalar | null
+        "respiration_rate": 16.0,                    // 2026-05-13
+        "systolic": null,                            // 2026-05-13: null when off-bed / no data
+        "diastolic": null                            // 2026-05-13
+      }
+    ]
+  }
+}
+```
+
+**2026-05-13 additions:**
+
+- `heart_rate` / `respiration_rate` / `systolic` / `diastolic` — flat scalars at the device level, each `number | null`. Just the latest reading (no thresholds — those live on `/mobile/get-alert-thresholds`). Null when the device is off-bed (`occupancy < 0.5`) or has no data in the 1-hour lookback. Off-bed masking matches `/mobile/get-latest-vitals` and `/mobile/get-groups`.
+- `has_active_alert` — `true` when any unresolved alert exists on the device. Convenient sibling to `alert_count` (which is the count of unresolved alerts).
+- `created_at` / `updated_at` — `created_at` is when the device row was first inserted; `updated_at` mirrors `last_seen_result` (the device's last heartbeat).
+
+Each device includes both old field names (`id`, `name`, `alertCount`) and new names (`device_id`, `device_description`, `alert_count`) for backward compatibility. The flat vital scalars + `has_active_alert` are computed in the same batch pass `/mobile/get-groups` uses, so the alerts screen can render the stats card without a second round-trip.
 </details>
 
 <details>
