@@ -1185,8 +1185,9 @@ Each push includes a `data` field your mobile app can branch on for routing:
 | `role_changed` | A manager changed your role | — |
 | `access_removed` | You were removed from a device | — |
 | `alert_resolved` | An alert on a device you watch was resolved | `device_mac` |
+| `alert_triggered` (2026-05-08) | A threshold was crossed and an alert just fired | `alert_id`, `device_mac`, `device_name` |
 
-Plus the alert-trigger pushes (from `NotificationDispatcher`) carry `alert_id`, `device_mac`, and `device_name` in `data` so the app can render a friendly header and deep-link to the alert detail screen even before the API roundtrip returns. The push **body** also leads with the device name, e.g. `"Living Room BedDot: Low Respiratory Rate"`. The same `device_name` is threaded into the alert email — the email subject reads `HomeDots [WARNING] — Living Room BedDot — Low Respiratory Rate` and the device card shows the friendly name on top with the MAC underneath.
+The `alert_triggered` push body leads with the device name, e.g. `"Living Room BedDot: Low Respiratory Rate"`, so the lock-screen / notification-center display is meaningful even before the app launches. The same `device_name` is also threaded into the alert email — subject reads `HomeDots [WARNING] — Living Room BedDot — Low Respiratory Rate` and the device card shows the friendly name on top with the MAC underneath as a monospace secondary identifier.
 
 ---
 
