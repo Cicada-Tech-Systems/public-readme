@@ -42,6 +42,7 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/resolve-alert` (2026-05-07) | Set `resolved_at` but left `status` at `acknowledged`/`triggered`. The next `/get-alerts-by-device` call returned a populated `resolved_at` alongside `status: "acknowledged"` — inconsistent state visible to mobile. | Now flips `status` to `"resolved"` along with `resolved_at`. Both fields move together. | No — bug fix |
 | `POST /mobile/remove-device-user` (2026-05-08) | Deleted the `UserDevice` row but left dangling `DeviceGroupMember` rows under the removed user's groups. The device kept appearing in `/mobile/get-groups` for the removed user (with a fake `viewer` role) even though every access-checking endpoint correctly returned 'No access'. | Also deletes the matching group-member rows. `/mobile/get-groups` no longer ghost-renders revoked devices. Defense in depth: `get-groups` now INNER JOINs `user_devices` so even unforeseen drift can't surface unauthorized rows. | No — bug fix |
 | `POST /mobile/remove-device` (2026-05-08) | Unclaiming a device deleted role rows + group memberships but left outstanding `user_invitations` Pending. Privilege escalation risk: an old invite link could be redeemed AFTER a different user re-claimed the same device, granting the original invitee access to the new owner's device. | Now flips every Pending/Active invitation on the device to `Revoked` as part of unclaim. `accept_invite_token` rejects them at redemption time. Migration 012 backfilled 4 existing orphans on prod. | No — security fix |
+| `POST /mobile/get-groups` (2026-05-13) | Each device row carried `device_id`, `device_description`, `device_mac`, `last_seen_raw`, `activity_status` (`"active"`/`"inactive"`/`"unknown"`), and `role`. Stats-card filters had no signal for "is this device currently transmitting" without parsing a string, and no signal at all for "does this device have an active alert" without a separate API call. The per-vital current/threshold data lived in a different endpoint, requiring two round-trips for the dashboard. | Each device row now also carries: `is_active` (boolean — true when `last_seen_result` is within 5 minutes), `has_active_alert` (boolean — any unresolved alert on the device), and a nested `vitals` block keyed by `heart_rate` / `respiratory_rate` / `systolic` / `diastolic`. Each vital entry exposes `{current, min, max, enabled, has_active_alert}`. `current` is masked to `null` when the device is off-bed (mirrors `/mobile/get-latest-vitals`); `min`/`max`/`enabled` come straight from `alert_rules` so the stats card can render the toggle and bounds without an extra `get-alert-thresholds` call. | No — additive |
 | `POST /mobile/invite-user` | Required `invitee_email`. Returned `{invitation_id}` | `invitee_email` optional. Returns `{invitation_id, invite_token}`. Sends push notification | **Yes** — role must be `"manager"` not `"co-owner"` |
 | `POST /mobile/delete-group` | Moved devices to default group | Devices move to "Ungrouped Devices" system group. Cannot delete the system group itself (400). | No |
 | `POST /mobile/rename-group` | No restrictions | Cannot rename "Ungrouped Devices" system group (400) | **Partial** — handle 400 for default group |
@@ -578,17 +579,63 @@ Set `delete_vitals: true` to also permanently erase all vital history from Influ
 </details>
 
 <details>
-<summary><b>POST /mobile/get-groups</b> — List all groups with devices</summary>
+<summary><b>POST /mobile/get-groups</b> — List all groups with devices (+ vitals + alert state)</summary>
 
 **Body:** `{user_name}`
 
-| Response | Status | Body |
-|----------|--------|------|
-| Success | `200` | `{data: {groups: [{group_id, group_name, device_count, is_default, devices: [{device_id, device_description, device_mac, last_seen_raw, activity_status, role}]}], ungrouped_devices: []}}` |
+**Response shape** (`200`):
 
-Every device belongs to a group. The "Ungrouped Devices" group (`is_default: true`) is auto-created and cannot be renamed, deleted, or have devices removed from it. When a device is removed from any other group, it moves to this group automatically. `ungrouped_devices` is always `[]` (kept for backward compatibility).
+```jsonc
+{
+  "data": {
+    "groups": [
+      {
+        "group_id": 1,
+        "group_name": "Bedroom",
+        "is_default": false,
+        "device_count": 1,
+        "devices": [
+          {
+            "device_id": 13,
+            "device_description": "Bedroom BedDot",
+            "device_mac": "aa:bb:cc:dd:ee:01",
+            "last_seen_raw": "2026-05-13 09:42:01",
+            "activity_status": "active",   // legacy string — "active" | "inactive" | "unknown"
+            "is_active": true,              // 2026-05-13: boolean form, for stats-card filters
+            "role": "owner",                // owner | manager | caregiver | viewer
+            "has_active_alert": false,      // 2026-05-13: any unresolved alert on this device
+            "vitals": {                     // 2026-05-13: per-vital current + thresholds + state
+              "heart_rate":       {"current": 72,  "min": 45, "max": 120, "enabled": true,  "has_active_alert": false},
+              "respiratory_rate": {"current": 16,  "min": 10, "max": 22,  "enabled": true,  "has_active_alert": false},
+              "systolic":         {"current": null, "min": 90, "max": 140, "enabled": false, "has_active_alert": false},
+              "diastolic":        {"current": null, "min": 60, "max": 90,  "enabled": false, "has_active_alert": false}
+            }
+          }
+        ]
+      }
+    ],
+    "ungrouped_devices": []
+  }
+}
+```
 
-Each group includes `is_default: true/false`. The default group sorts first. As of the 2026-04-24 release, only the **new** field names are returned — `device_id`, `device_description`, `device_mac` (for devices) and `group_id`, `group_name` (for groups). The legacy duplicates `id` / `name` / `mac_address` have been removed.
+**Device-level fields (2026-05-13 additions):**
+
+- `is_active` — `true` when `last_seen_result` is within the last 5 minutes. Use this instead of parsing the legacy `activity_status` string when filtering stats cards.
+- `has_active_alert` — `true` when any `alert_history` row for this device is still unresolved (`status` in `triggered` / `acknowledged`). Drives the red badge on the stats card.
+
+**Per-vital block (2026-05-13):** the four standard vitals are always present, even on devices with no configured rules or no recent data. Inside each entry:
+
+- `current` — latest reading from the TimescaleDB hypertable (1-hour lookback). `null` when the device is off-bed (`occupancy < 0.5`) or has no data in the window. Off-bed masking matches `/mobile/get-latest-vitals`.
+- `min` / `max` — configured thresholds from `alert_rules`. `null` when no rule exists for this measurement on this device.
+- `enabled` — `true` when the user has alerts enabled for this measurement. `false` when the rule is absent or toggled off.
+- `has_active_alert` — `true` when this specific measurement has at least one unresolved alert row.
+
+The vitals block is computed in one batch pass per response (3 queries total regardless of device count), so adding many devices to many groups doesn't multiply query load.
+
+**Group structure:** every device belongs to a group. The "Ungrouped Devices" group (`is_default: true`) is auto-created and cannot be renamed, deleted, or have devices removed from it. When a device is removed from another group, it moves to this group automatically. `ungrouped_devices` is always `[]` (kept for backward compatibility). The default group sorts first.
+
+As of the 2026-04-24 release, only the **new** field names are returned — `device_id`, `device_description`, `device_mac` (devices) and `group_id`, `group_name` (groups). The legacy duplicates `id` / `name` / `mac_address` have been removed.
 </details>
 
 <details>
