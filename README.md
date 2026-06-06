@@ -91,6 +91,8 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/set-alert-rule` (2026-05-08) | Upsert one measurement's threshold range. Body: `{device_mac, measurement, min, max}` (min/max nullable for one-sided rules like "alert only when temp goes above 38"). Always sets `enabled=True`. Doesn't touch other measurements. Owner/manager only. | When the threshold-edit UI changes a single vital — smaller payload than `update-alert-thresholds` and explicit "I'm editing the range" intent. |
 | `POST /mobile/toggle-alert-rule` (2026-05-08) | Enable/disable one measurement's rule without touching its threshold values. Body: `{device_mac, measurement, enabled}`. Toggling off then back on preserves the user's saved `min`/`max` so the chart can keep showing them while alerts are off. Owner/manager only. | When the per-vital alert-on/off switch is toggled. |
 | `POST /mobile/toggle-device-alerts` (2026-05-08) | Master switch for a device — flips `enabled` on every rule for that device. Body: `{device_mac, enabled}`. Threshold values preserved on every row. Owner/manager only. | When the user toggles the device-level "Alerts" switch on the device settings screen. |
+| `POST /mobile/delete-sent-invitation` (2026-06-06) | Per-user soft-delete — hides an invitation from the caller's outbox (`get-sent-invitations`). Body: `{invitation_id}`. The DB row stays — invite_token, audit history, and the recipient's inbox view are all untouched. Idempotent. Caller must be the original inviter. To revoke a Pending invite server-side (so the link stops working) use `cancel-invitation` instead — different concern. | When adding a "Delete" / "Clear" button to the Sent invitations page. |
+| `POST /mobile/delete-received-invitation` (2026-06-06) | Per-user soft-delete — hides an invitation from the caller's inbox (`get-received-invitations`). Body: `{invitation_id}`. Symmetric with the sent variant: sender's outbox view and audit history are untouched. Idempotent. Recipient match by `invitee_user_id` OR one of the caller's verified email addresses. | When adding a "Delete" / "Clear" button to the Received invitations page. |
 
 ### Removed Endpoints
 
@@ -1055,6 +1057,50 @@ For **Expired** invitations (added 2026-04-30): the row is resurrected. `status`
 `Active` (already accepted), `Declined`, and `Revoked` are deliberate end states and remain rejected — to invite that user again, send a fresh `/mobile/invite-user`.
 
 Auth: any owner or manager on the invitation's device may resend (not just the original inviter). Push only delivers if the invitee has an account.
+</details>
+
+<details>
+<summary><b>POST /mobile/delete-sent-invitation</b> — Hide an invitation from the caller's Sent list (2026-06-06)</summary>
+
+**Body:** `{invitation_id}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Invitation deleted from sent list"}` |
+| Not the original inviter | `401` | `{message: "Only the original inviter can delete this invitation from their sent list"}` |
+| Unknown invitation_id | `404` | `{message: "Invitation not found"}` |
+
+**Per-user soft-delete** — stamps `deleted_by_inviter_at` on the row. Effects:
+
+- The invitation disappears from `/mobile/get-sent-invitations` for this user.
+- The DB row stays. The `invite_token` keeps working (Pending invites remain redeemable), `target_invitation_id` lookups still resolve, and the audit history is intact.
+- **The recipient's inbox view is untouched** — `/mobile/get-received-invitations` still surfaces the row to the invitee.
+- **Status is untouched** — soft-delete is a list-view filter, not a state transition. To revoke a Pending invite server-side (so the deep link stops working), call `/mobile/cancel-invitation` instead. The two actions are independent and can be combined.
+- **Idempotent** — calling twice returns 200 both times.
+
+Use this for the **"Clear"** / **"Remove from list"** action on the Sent invitations page once the user is done with that row (e.g. after the invitee accepted, declined, or it expired — and you don't want it cluttering the list anymore).
+</details>
+
+<details>
+<summary><b>POST /mobile/delete-received-invitation</b> — Hide an invitation from the caller's Received list (2026-06-06)</summary>
+
+**Body:** `{invitation_id}`
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Invitation deleted from received list"}` |
+| Not the recipient | `401` | `{message: "Only the invitation recipient can delete it from their received list"}` |
+| Unknown invitation_id | `404` | `{message: "Invitation not found"}` |
+
+**Per-user soft-delete** — stamps `deleted_by_invitee_at` on the row. Symmetric with `/mobile/delete-sent-invitation`:
+
+- The invitation disappears from `/mobile/get-received-invitations` for this user.
+- The DB row stays. The sender's outbox view (`/mobile/get-sent-invitations`) is untouched.
+- **Status is untouched.** Declining an invite (so the sender sees the rejection) is a separate call — `/mobile/respond-invitation` with `accept: false`. Deleting from the inbox doesn't tell the sender anything.
+- Recipient match: caller's `user_id == invitee_user_id` OR one of the caller's verified email addresses equals `invitee_email`. Same predicate `/mobile/get-received-invitations` uses (covers the case where an invite was emailed to an address that registered under a different user_id).
+- **Idempotent.**
+
+Use this for the **"Clear"** / **"Remove from list"** action on the Received invitations page after the user has dealt with the invite (or doesn't care about it).
 </details>
 
 <details>
