@@ -93,6 +93,8 @@ If your app was built against the previous API, review the items below. Items ma
 | `POST /mobile/toggle-device-alerts` (2026-05-08) | Master switch for a device — flips `enabled` on every rule for that device. Body: `{device_mac, enabled}`. Threshold values preserved on every row. Owner/manager only. | When the user toggles the device-level "Alerts" switch on the device settings screen. |
 | `POST /mobile/delete-sent-invitation` (2026-06-06) | Per-user soft-delete — hides an invitation from the caller's outbox (`get-sent-invitations`). Body: `{invitation_id}`. The DB row stays — invite_token, audit history, and the recipient's inbox view are all untouched. Idempotent. Caller must be the original inviter. To revoke a Pending invite server-side (so the link stops working) use `cancel-invitation` instead — different concern. | When adding a "Delete" / "Clear" button to the Sent invitations page. |
 | `POST /mobile/delete-received-invitation` (2026-06-06) | Per-user soft-delete — hides an invitation from the caller's inbox (`get-received-invitations`). Body: `{invitation_id}`. Symmetric with the sent variant: sender's outbox view and audit history are untouched. Idempotent. Recipient match by `invitee_user_id` OR one of the caller's verified email addresses. | When adding a "Delete" / "Clear" button to the Received invitations page. |
+| `POST /mobile/notifications/list` (2026-06-06) | Notification center for the caller — every alert push/email targeted at this user, newest first. Body: `{limit?, offset?, status?}`. Returns `{notifications, has_more, unread_count}`. Each row carries delivery state (`channel`, `status`, `sent_at`, `created_at`, `read`) and a nested `alert` block (`title`, `severity`, `device_mac`, `device_name`, etc.) so the row renders in one shot. | When adding the bell-icon notifications screen. |
+| `POST /mobile/notifications/mark-read` (2026-06-06) | Mark one (or all) notifications as read. Body: `{delivery_id?, mark_all?}` — exactly one required. Stamps `read_at` on the row; idempotent (a row already read returns `updated: 0`). | When the user opens a notification or hits "Mark all read". |
 
 ### Removed Endpoints
 
@@ -605,7 +607,7 @@ Set `delete_vitals: true` to also permanently erase all vital history from Influ
             "device_mac": "aa:bb:cc:dd:ee:01",
             "last_seen_raw": "2026-05-13 09:42:01",
             "activity_status": "active",        // "active" | "inactive" | "unknown"
-            "occupied_status": "unknown",
+            "occupied_status": "occupied",      // 2026-06-06: "occupied" | "unoccupied" | "unknown"
             "role": "owner",                    // owner | manager | caregiver | viewer
             "has_active_alert": false,          // 2026-05-13
             "heart_rate":       {"current": 72,   "min": 45, "max": 120},  // 2026-05-13
@@ -1291,6 +1293,72 @@ Partial updates merge — sending `{events: {alerts: {email: false}}}` only chan
 </details>
 
 **Push + email sent for:** alert triggers (push + email per severity routing), alert escalations, alert resolution (push only), invitation received (push only — the initial invite-user flow already sends an email with the deep link), invitation accepted/declined (push + email), access request received (push + email), role changed (push + email), user removed from device (push + email). All channels gated by per-user, per-event preferences.
+
+<details>
+<summary><b>POST /mobile/notifications/list</b> — Notification center: every alert push/email targeted at the caller (2026-06-06)</summary>
+
+**Body:** `{limit?: int = 50, offset?: int = 0, status?: 'sent' | 'pending' | 'failed' | null}`
+
+| Field | Default | Notes |
+|---|---|---|
+| `limit` | `50` | 1–200. Clamped at the boundary. |
+| `offset` | `0` | Pagination offset. |
+| `status` | `null` | `null` = all statuses; explicit values restrict to that delivery state. |
+
+| Response | Status | Body |
+|---|---|---|
+| Success | `200` | `{data: {notifications: [...], has_more: bool, unread_count: int}}` |
+
+Each notification row:
+
+```jsonc
+{
+  "delivery_id": 482,
+  "alert_id": 17,
+  "channel": "push",                     // "push" | "email" | "in_app"
+  "status": "sent",                      // "sent" | "pending" | "failed"
+  "sent_at": "2026-06-06 14:02:11.230",
+  "created_at": "2026-06-06 14:02:09.018",
+  "error_message": null,                 // populated when status = failed
+  "read": false,                         // backed by alert_deliveries.read_at
+  "alert": {
+    "title": "Low Respiratory Rate",
+    "severity": "warning",               // "critical" | "warning" | "info"
+    "status": "triggered",               // "triggered" | "acknowledged" | "resolved"
+    "current_value": 9.4,
+    "threshold_value": 10.0,
+    "unit": "rpm",
+    "measurement": "respiratoryrate",
+    "device_mac": "30:30:f9:73:4c:0c",
+    "device_name": "Bedroom BedDot",
+    "issue_time": "2026-06-06 14:02:08.901"
+  }
+}
+```
+
+**Pagination:** `has_more` is true when at least one row exists past `offset + limit`. Fetch the next page with `{offset: offset + limit}`.
+
+**Unread badge:** `unread_count` reflects the current filter — if you set `status: 'failed'`, the badge counts only unread failures (matches what the user is looking at). For the global badge across the whole notification center, send an empty body.
+
+**Authorization:** rows are scoped to the caller — `recipient_user_id == caller`. Notifications dispatched to other users never appear.
+</details>
+
+<details>
+<summary><b>POST /mobile/notifications/mark-read</b> — Mark a notification (or all) as read (2026-06-06)</summary>
+
+**Body:** `{delivery_id?: int, mark_all?: bool}` — exactly one of the two must be supplied.
+
+| Response | Status | Body |
+|---|---|---|
+| Success | `200` | `{data: {updated: int}}` |
+| Both fields set | `400` | `{message: "Provide exactly one of delivery_id or mark_all"}` |
+| Neither field set | `400` | `{message: "Provide delivery_id or mark_all=true"}` |
+| Delivery doesn't belong to caller, or unknown id | `404` | `{message: "Notification not found"}` |
+
+`updated` is the number of rows whose `read_at` actually changed. Idempotent: re-marking an already-read row returns `updated: 0` (not an error). For `mark_all`, every currently-unread row for the caller flips in one statement.
+
+**Privacy:** marking another user's `delivery_id` returns `404` (not `403`) so you can't enumerate someone else's delivery IDs.
+</details>
 
 ### Push notification data payload
 
