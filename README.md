@@ -4,116 +4,54 @@ Healthcare IoT backend for BedDot sensor devices. Provides device management, vi
 
 ---
 
-## Migration Guide — What Changed
+## Recent Changes
 
-If your app was built against the previous API, review the items below. Items marked **BREAKING** require code changes.
+### 1. Delete-invitation API (sent + received)
 
-### Breaking Changes
+Two new endpoints let users clear invitations from their own inbox/outbox without affecting the other side:
 
-| # | Change | Details | Action Required |
-|---|--------|---------|-----------------|
-| 1 | **Role renamed** | `co-owner` → `manager` | Replace all `"co-owner"` strings with `"manager"` in invite/role API calls |
-| 2 | **`/mobile/auth/verify-firebase-token` removed** | Firebase phone auth no longer supported | Use `/mobile/auth/google` or `/mobile/auth/apple` instead |
-| 3 | **`/mobile/invite-user` body changed** | `invitee_email` was required, now optional | No action if you always send it. New: response includes `invite_token` field |
-| 4 | **Error status codes reclassified** (2026-04-24) | Many client errors were returning `500` (the raw `AppError` default). They now return the correct 4xx class: `400` (validation), `401` (auth failure), `403` (permission), `404` (not found), `409` (conflict / duplicate). | Clients that branched on `500` as a catch-all for all failures must now handle specific 4xx codes. Messages are unchanged — the change is HTTP status only. |
-| 5 | **Refresh-token rotation revokes the old access token** (2026-04-24) | Calling `/mobile/auth/refresh-token` used to return a new pair but the old access token stayed valid until its `exp`. It is now revoked server-side at rotation time. | After calling `/refresh-token`, replace BOTH stored tokens; requests with the previous access token return `401` even before `exp`. |
-| 6 | **Auth rate limits raised** (2026-04-24) | All auth endpoints were uniformly `5/min`. Login bumped to `30/min`, verify-otp `15/min`, signup `10/min`. Email-sending endpoints (resend-otp, reset-password) stay at `5/min`. | None — clients only see fewer 429s. |
-| 7 | **Email + MAC normalisation** (2026-04-25) | `email` / `invitee_email` / `device_mac` were stored verbatim. Server now lowercases + strips before any lookup or write; existing rows backfilled. | None — already-normalised input is a no-op. Mobile clients should still send the original case for display, but stop hand-rolling case-folding for the wire. |
-| 8 | **Invite remove/role-change require ONE of target_user_id or target_email** (2026-04-25) | `RemoveDeviceUserBody` / `UpdateDeviceUserRoleBody` previously required `target_user_id: int`. Sending `target_user_id: null` for a pending-invite-to-unregistered-email failed with a generic 422 / 404. They now accept either field; clients must send exactly one. | **Yes** — clients sending `target_user_id: null` for unregistered invitees must switch to `target_email: <email>` (the email is already in the `get-device-users` response). |
-| 9 | **Master/slave mode removed** (2026-04-29) | The `IS_MASTER_SERVER` dual-mode pattern, the `_post_to_master` slave-forwarding path, and the legacy `auth_user(user_name, user_token)` body-based auth path were all deleted. The backend is single-master now. JWT is the only mobile-auth mechanism. | Drop `IS_MASTER_SERVER`, `MASTER_SERVER_URL`, and the legacy backend `user_token` from your env / config. If you ran a slave deployment, redeploy as master against the prod DB. Future multi-region / HIPAA deployments will get a fresh service-auth design (mTLS / service JWTs). |
-| 10 | **JWT carries `user_id` claim alongside `mobile_user_id`** (2026-04-29) | The user_conf + mobile_users merge unified the user table. JWTs minted post-merge include both `user_id` (canonical going forward) and `mobile_user_id` (back-compat) so in-flight tokens keep working. The two values are equal. | Prefer reading `user_id` from JWT payloads. The `mobile_user_id` claim will be removed after the refresh-token rollover window (~2026-05-29). |
+| Endpoint | Who can call | Effect |
+|---|---|---|
+| `POST /mobile/delete-sent-invitation` | Original inviter only | Soft-deletes from the caller's sent list |
+| `POST /mobile/delete-received-invitation` | Verified recipient only (matched by `invitee_user_id` or verified email) | Soft-deletes from the caller's received list |
 
-### Changed Endpoints (same path, different behavior)
+Body: `{invitation_id}`. The DB row stays — the audit history and the other party's view are untouched. Idempotent (re-deleting returns 200), so a client-side "Are you sure?" confirm dialog is safe to retry.
 
-| Endpoint | Was (old) | Now (new) | Breaking? |
-|----------|-----------|-----------|-----------|
-| `POST /mobile/auth/signup` | 409 if email exists | 409 if verified email exists. Recycles unverified accounts with expired OTP | No |
-| `POST /mobile/add-device` | Required `device_name`, `group_id`, `device_mac`. Device had to exist in DB (admin pre-registered). Error if already claimed. | `device_name`, `group_id`, and `device_mac` are all optional. Auto-creates device record. Returns `{status: "device_already_claimed"}` instead of error. Accepts `claim_token` alone (QR code flow — no MAC needed). MAC-like 12-hex-char tokens auto-resolve to MAC addresses. | **Partial** — check for `status` field in response |
-| `POST /mobile/add-device` | Device auto-added to default group | Device starts in "Ungrouped Devices" system group | No |
-| `POST /mobile/get-groups` | Returned `{data: {groups: [...]}}` | Returns `{data: {groups: [...], ungrouped_devices: []}}`. All devices are now in a group. `ungrouped_devices` is always empty (kept for backward compat). Each group has `is_default` field. | No — old `groups` key still works |
-| `POST /mobile/get-groups` | No system group concept | "Ungrouped Devices" is a mandatory system group (`is_default: true`). Cannot be renamed, deleted, or have devices removed from it. Devices auto-move to it when removed from other groups. | No — additive change |
-| `POST /mobile/get-groups` | Device/group fields: `id`, `name`, `mac_address` | Returns ONLY new names: `device_id`, `device_description`, `device_mac`, `group_id`, `group_name`. The legacy duplicate aliases were removed in the 2026-04-24 release. | **Yes** — clients still reading `id`/`name`/`mac_address` must switch to the new names |
-| `POST /mobile/get-devices-with-alerts` | Response had `id`, `name`, `alertCount` | Returns BOTH old AND new field names (`device_id`, `device_description`, `alert_count`) | No |
-| `POST /mobile/get-alerts-by-device` | Response had `id`, `current`, `threshold`, `alertStatus` | Returns BOTH old AND new field names (`alert_id`, `current_value`, `threshold_value`, `alert_status`) plus new `status`, `severity`, `acknowledged_at` | No |
-| `POST /mobile/get-alerts-by-device` (2026-05-04) | Response only carried alert-row fields. Mobile had to make a separate call to learn which device_name to render in the header and whether the caller could ack/dismiss. Per-alert `severity` and lifecycle `status` were dropped at the router even though the model populated them. | Top-level `device_name` and `user_role` (`owner`/`manager`/`caregiver`/`viewer`) are now in the response payload alongside `alerts`. Each alert dict now also surfaces `severity` (`critical`/`warning`/`info`) and `status` (`triggered`/`acknowledged`/`resolved`). Viewers continue to see alerts but server still rejects ack/resolve from them — mobile should hide those buttons when `user_role === 'viewer'`. | No — additive |
-| Alert title format (2026-05-04) | Title was `"{measurement} {direction} threshold: {value} {op} {threshold}"`, e.g. `"respiratoryrate below threshold: 9.4 < 10.000"`. Squashed column name and Numeric trailing zeros leaked into the UI and push body. | Concise label form: `"Low Respiratory Rate"` / `"High Heart Rate"` / `"High Systolic Blood Pressure"`, etc. Current/threshold values were already on the alert card and in the response, so the title no longer repeats them. | No — historical alerts keep their old title text; new ones use the new form |
-| `POST /mobile/get-alert-thresholds` (2026-05-08) | Response was `{thresholds: {hr: {min, max}, rr: {min, max}, bph: {min, max}, bpl: {min, max}, oc: {on, off}}}` — short codes, no per-measurement enabled flag. Backed by a `device.alert_setting` JSON column the threshold checker never read from. | Response is now `{thresholds: {measurement: {min, max, enabled}}}` keyed by full measurement names (`heartrate`, `respiratoryrate`, `systolic`, `diastolic`, plus any future vitals like `spo2`/`temperature`). Reads from the `alert_rules` table — same source the server uses to actually fire alerts. Each entry carries an `enabled` boolean so the UI can render the toggle in its current state. | **Yes** — clients reading `hr.max` etc. must switch to `heartrate.max` etc. |
-| `POST /mobile/update-alert-thresholds` (2026-05-08) | Wrote the JSON body verbatim into `device.alert_setting`. **Never updated `alert_rules`**, so user-customized thresholds were silently ignored by the threshold checker — every device alerted on the seeded defaults regardless of what the mobile app saved. | Now reconciles directly into `alert_rules`. Payload shape unchanged: `{thresholds: {measurement: {min, max}}}`. Semantics: keys present → upserted with `enabled=True`; keys absent → existing rules flipped to `enabled=False` (this is how the UI says "disable just respiratory rate"); empty `{}` → every rule disabled (master off). Threshold values are preserved on disable so re-enabling later doesn't require re-entering ranges. | No — bulk shape unchanged. New per-rule + per-device toggle endpoints below offer cleaner alternatives. |
-| `POST /mobile/resolve-alert` (2026-05-07) | Set `resolved_at` but left `status` at `acknowledged`/`triggered`. The next `/get-alerts-by-device` call returned a populated `resolved_at` alongside `status: "acknowledged"` — inconsistent state visible to mobile. | Now flips `status` to `"resolved"` along with `resolved_at`. Both fields move together. | No — bug fix |
-| `POST /mobile/remove-device-user` (2026-05-08) | Deleted the `UserDevice` row but left dangling `DeviceGroupMember` rows under the removed user's groups. The device kept appearing in `/mobile/get-groups` for the removed user (with a fake `viewer` role) even though every access-checking endpoint correctly returned 'No access'. | Also deletes the matching group-member rows. `/mobile/get-groups` no longer ghost-renders revoked devices. Defense in depth: `get-groups` now INNER JOINs `user_devices` so even unforeseen drift can't surface unauthorized rows. | No — bug fix |
-| `POST /mobile/remove-device` (2026-05-08) | Unclaiming a device deleted role rows + group memberships but left outstanding `user_invitations` Pending. Privilege escalation risk: an old invite link could be redeemed AFTER a different user re-claimed the same device, granting the original invitee access to the new owner's device. | Now flips every Pending/Active invitation on the device to `Revoked` as part of unclaim. `accept_invite_token` rejects them at redemption time. Migration 012 backfilled 4 existing orphans on prod. | No — security fix |
-| `POST /mobile/remove-device` (2026-05-13) | Unclaiming a device left every unresolved `alert_history` row in place. If a different user re-claimed the same device, `/mobile/get-groups` and `/mobile/get-devices-with-alerts` surfaced the previous owner's alerts as if they belonged to the new owner (`has_active_alert` true, `alert_count` non-zero). | Now auto-resolves every unresolved alert on the device as part of unclaim. The rows are kept for audit (alert_history is historical), just flipped to `status='resolved'` with `resolved_at=now()` so the dashboards stay clean for whoever claims next. | No — UX fix |
-| `POST /mobile/get-groups` (2026-05-13) | Each device row carried `device_id`, `device_description`, `device_mac`, `last_seen_raw`, `activity_status`, and `role`. Stats-card filters had no signal for "does this device have an active alert", and the per-vital current/threshold data lived in a different endpoint, requiring two round-trips. | Each device row now also carries `has_active_alert` (boolean — any unresolved alert on the device) plus four top-level vital blocks keyed by `heart_rate` / `respiration_rate` / `systolic` / `diastolic`. Each block is shaped `{current, min, max}` per the `GetDeviceGroupsResponseType` mobile contract — `current` is the latest reading (null when off-bed or no data), `min`/`max` come from `alert_rules` (null when no rule or rule disabled). | No — additive |
-| `POST /mobile/get-devices-with-alerts` (2026-05-13) | Returned `device_id`/`id`, `device_mac`, `name`/`device_description`, `role`, `alert_count`/`alertCount`, `last_seen_result`. No vitals — dashboards had to call `/mobile/get-latest-vitals` separately just to render the stats card. | Same shape plus four flat vital scalars (`heart_rate`, `respiration_rate`, `systolic`, `diastolic` — each a `number \| null` carrying the latest reading), `has_active_alert`, and `created_at` / `updated_at` timestamps. Off-bed masking applies (medical vitals null when occupancy < 0.5). Matches the `GetDevicesWithAlertsResponseType` mobile contract. | No — additive |
-| `POST /mobile/invite-user` | Required `invitee_email`. Returned `{invitation_id}` | `invitee_email` optional. Returns `{invitation_id, invite_token}`. Sends push notification | **Yes** — role must be `"manager"` not `"co-owner"` |
-| `POST /mobile/delete-group` | Moved devices to default group | Devices move to "Ungrouped Devices" system group. Cannot delete the system group itself (400). | No |
-| `POST /mobile/rename-group` | No restrictions | Cannot rename "Ungrouped Devices" system group (400) | **Partial** — handle 400 for default group |
-| `POST /mobile/remove-device-from-group` | Device became ungrouped | Device moves to "Ungrouped Devices". Cannot remove from the system group itself (400). | **Partial** — handle 400 for default group |
-| `POST /mobile/get-dashboard-stats` | Only counted owned devices | Counts owned + shared devices (via roles) | No — more accurate count |
-| `POST /mobile/user-profile` | Returns caller's own profile only | Accepts optional `target_user_id` in body. Returns target's profile (only shared devices shown). Caller must share a device with target. | No — backward compatible |
-| `POST /mobile/resolve-alert` | Any user with device access could resolve | Only owner, manager, caregiver can resolve. Viewers get 401. | **Partial** — viewers will now get errors |
-| `POST /mobile/respond-invitation` | No notification sent | Sends push notification to inviter | No |
-| `POST /mobile/get-vitals` | Returned ~2 data points per hour (full-range aggregation) | Returns ~240 data points per hour (auto-scaled). End timestamp clamped to server time. | No — more data, same format |
-| `POST /mobile/update-device-user-role` | Owner or co-owner could change roles | Owner AND manager can change non-owner roles. Viewers and caregivers get 403. The owner's role cannot be changed via this endpoint (use `remove-device` to unclaim). | **Partial** — caregivers/viewers will now get 403 |
-| `POST /mobile/user/delete-account` | Was a stub (501) | Now works — soft-deletes account | No |
-| `POST /mobile/notifications/register` | Was a stub (501) | Now works — registers FCM token | No — was unused |
-| `POST /mobile/notifications/preferences` | Was a stub (501) | Now works — toggles push/email | No — was unused |
-| `POST /mobile/export-vitals` | Was a stub (501) | Now works — returns CSV or JSON file | No — was unused |
-| `POST /mobile/get-device-users` | Returned `{id, name, role, status}` per user. Owner could be missing if they had no role row. | Returns `{id, name, email, role, status}`. Owner always included. Pending invitations resolve `id` from registered accounts. Expired pending invitations filtered out. | **Partial** — new `email` field added. `id` no longer null for registered pending users. |
-| `POST /mobile/invite-user` | Allowed duplicate pending invitations for same email. Did not check if invitee already had access. | Rejects duplicate pending invitations (409). Rejects inviting users who already have access or are the device owner (409). Sets `invitee_user_id` when invitee has an account. | **Partial** — new 409 responses for duplicates |
-| `POST /mobile/update-device-user-role` | Silently returned 200 when trying to change owner's role (no rows updated). Returned 200 for non-existent target users. | Returns 400 `"Cannot change the device owner's role"`. Returns 404 `"Target user not found on this device"`. | **Partial** — new error responses |
-| `POST /mobile/get-device-users` (2026-04-29) | Pending invitations returned `id: null` when the invitee had no account, leaving the mobile app with no stable row key. | Each row now carries `invitation_id` alongside `id`. Pending rows have a non-null `invitation_id`; Active rows have `invitation_id: null`. | No — additive field |
-| `POST /mobile/get-received-invitations` (renamed from `/mobile/get-invitations` on 2026-04-29) | Old path returned only Pending received invitations. Response per row had `invitation_id, invited_by, device, role, status, invited_at`. | New path returns every status (Pending + Active + Declined + Expired + Revoked) — symmetric with `get-sent-invitations`. Mobile app filters client-side. Response gains `note`, `expires_at`, `invitee_email`. Body stays `{}`. | **Yes** — endpoint path changed AND filter behavior changed. Update the URL to `/mobile/get-received-invitations` and filter by `status === 'Pending'` for the inbox view. The old `/mobile/get-invitations` path now returns 404. |
-| `POST /mobile/accept-invite-link` (2026-04-29) | A targeted invite (where `invitee_email` was set) could only be accepted by an account whose registered email matched. | The email lock is now only enforced when the invitee already had an account at invite time (`invitee_user_id` set). Targeted invites to unregistered emails accept under any email — the recipient may have signed up under a different one. | No — strictly more permissive |
-| `POST /mobile/remove-device-user`, `POST /mobile/update-device-user-role` (2026-04-30) | Body required exactly one of `target_user_id` or `target_email`. Pending invitations were targeted via the fuzzy `target_email` branch, which could match the wrong row when multiple Pending invitations existed for the same email + device. | Body now accepts a third option: `target_invitation_id`. Pass it for Pending rows (the value comes straight from `get-device-users`'s `invitation_id` field) for a deterministic single-row match. `target_user_id` is still preferred for Active users; `target_email` stays supported as a legacy fallback. The validator now requires **exactly one** of the three identifiers. | No — additive field |
-| `POST /mobile/cancel-invitation`, `POST /mobile/update-invitation`, `POST /mobile/resend-invitation` (2026-04-30) | Auth required `inviter_user_id == caller`. Managers who didn't personally send an invite hit 401 even with full manage access on the device. | Auth now requires owner-or-manager on the invitation's device (not just the original inviter). Matches the auth model used by `remove-device-user` / `update-device-user-role`. Manage-access lookup uses `inv.device_id` so cross-device targeting is still blocked. | No — strictly more permissive. Error message changed from "Only the original inviter can …" to "Only device owners and managers can …" |
-| `POST /mobile/resend-invitation` (2026-04-30) | Rejected `Expired` invitations with 400. | Now accepts `Expired` and resurrects them: status flips back to `Pending`, `expires_at` bumped +7 days. Active/Declined/Revoked still rejected. | No — strictly more permissive |
+To **revoke** a pending invitation server-side (so the invite link stops working), use `/mobile/cancel-invitation` — that's a different action.
 
-### New Endpoints (not in previous version)
+### 2. Notification listing API
 
-| Endpoint | Purpose | When to adopt |
-|----------|---------|---------------|
-| `POST /mobile/auth/google` | Google Sign-In via JWKS | When adding Google Sign-In to app |
-| `POST /mobile/auth/apple` | Apple Sign-In via JWKS | When adding Apple Sign-In to app |
-| `POST /mobile/auth/logout` | Revoke the current access + refresh tokens server-side | When adding sign-out (recommended — stops stolen tokens from being usable) |
-| `POST /mobile/update-device` | Rename a device (owner/manager) | When adding device settings UI |
-| `POST /mobile/remove-device` | Unclaim a device, release all access | When adding device removal from account |
-| `POST /mobile/rename-group` | Rename a group | When adding group edit UI |
-| `POST /mobile/request-device-access` | Request view access to another user's device | When adding device sharing discovery |
-| `POST /mobile/acknowledge-alert` | Mark alert as "I'm handling it" (stops escalation) | When adding alert workflow |
-| `POST /mobile/accept-invite-link` | Accept a shareable invite token | When adding invite link deep links |
-| `POST /mobile/invite-user-to-group` | Invite user to ALL devices in a group | When adding group sharing |
-| `POST /mobile/get-latest-vitals` | Latest reading for all devices in one call | For dashboard home screen |
-| `POST /mobile/notifications/unregister` | Remove FCM token on logout | When implementing push |
-| `POST /mobile/user-profile` | User details + associated devices. Optional `target_user_id` to view another user (must share a device). | For user profile and "view user details" in device user list |
-| `POST /mobile/get-sent-invitations` (2026-04-29) | Outbox view — invitations the caller has sent. Returns all statuses (Pending/Active/Declined/Expired/Revoked) with `invite_token` for the copy-link UI action, plus `note`, `sent_at`, `expires_at`, `use_count`, `max_uses`. | When adding a "Sent" tab to the invitations page |
-| `POST /mobile/resend-invitation` (2026-04-29, expanded 2026-04-30) | Re-fires the invite email + push for a Pending or Expired invitation. Caller must be an owner or manager on the invitation's device (no longer inviter-only). For Pending invites, no DB change. For Expired invites, the row is resurrected: `status` flips back to `Pending` and `expires_at` is bumped 7 days forward (same `invite_token`/`role`/`note`). | When adding a "Resend" button to the Sent invitations page |
-| `POST /mobile/set-alert-rule` (2026-05-08) | Upsert one measurement's threshold range. Body: `{device_mac, measurement, min, max}` (min/max nullable for one-sided rules like "alert only when temp goes above 38"). Always sets `enabled=True`. Doesn't touch other measurements. Owner/manager only. | When the threshold-edit UI changes a single vital — smaller payload than `update-alert-thresholds` and explicit "I'm editing the range" intent. |
-| `POST /mobile/toggle-alert-rule` (2026-05-08) | Enable/disable one measurement's rule without touching its threshold values. Body: `{device_mac, measurement, enabled}`. Toggling off then back on preserves the user's saved `min`/`max` so the chart can keep showing them while alerts are off. Owner/manager only. | When the per-vital alert-on/off switch is toggled. |
-| `POST /mobile/toggle-device-alerts` (2026-05-08) | Master switch for a device — flips `enabled` on every rule for that device. Body: `{device_mac, enabled}`. Threshold values preserved on every row. Owner/manager only. | When the user toggles the device-level "Alerts" switch on the device settings screen. |
-| Invitation email (2026-06-06) — server-side rendering | The invite email contained a **View Invitation** button + a fallback "Copy this link" text link. | Also embeds a **QR code** (inline base64 PNG, no external hosting needed) of the same `https://api.homedots.us/invite/<invite_token>` URL the button targets. Scanning with the phone camera opens the invite landing page → Universal Link / App Link hands off to the BedDot app when installed. The button + text link are unchanged, so older email clients still work. Generated by the email service via the [qrcode](https://www.npmjs.com/package/qrcode) Node package. | No — no API change |
-| `POST /mobile/delete-sent-invitation` (2026-06-06) | Per-user soft-delete — hides an invitation from the caller's outbox (`get-sent-invitations`). Body: `{invitation_id}`. The DB row stays — invite_token, audit history, and the recipient's inbox view are all untouched. Idempotent. Caller must be the original inviter. To revoke a Pending invite server-side (so the link stops working) use `cancel-invitation` instead — different concern. | When adding a "Delete" / "Clear" button to the Sent invitations page. |
-| `POST /mobile/delete-received-invitation` (2026-06-06) | Per-user soft-delete — hides an invitation from the caller's inbox (`get-received-invitations`). Body: `{invitation_id}`. Symmetric with the sent variant: sender's outbox view and audit history are untouched. Idempotent. Recipient match by `invitee_user_id` OR one of the caller's verified email addresses. | When adding a "Delete" / "Clear" button to the Received invitations page. |
-| `POST /mobile/notifications/list` (2026-06-06) | Notification center for the caller — every alert push/email targeted at this user, newest first. Body: `{limit?, offset?, status?}`. Returns `{notifications, has_more, unread_count}`. Each row carries delivery state (`channel`, `status`, `sent_at`, `created_at`, `read`) and a nested `alert` block (`title`, `severity`, `device_mac`, `device_name`, etc.) so the row renders in one shot. | When adding the bell-icon notifications screen. |
-| `POST /mobile/notifications/mark-read` (2026-06-06) | Mark one (or all) notifications as read. Body: `{delivery_id?, mark_all?}` — exactly one required. Stamps `read_at` on the row; idempotent (a row already read returns `updated: 0`). | When the user opens a notification or hits "Mark all read". |
+`POST /mobile/notifications/list` powers the bell screen (the previous version had no listing endpoint, so the screen was empty).
 
-### Removed Endpoints
+- Body: `{limit?, offset?, status?}` — defaults `50` / `0` / all statuses
+- Response: `{notifications, has_more, unread_count}`, newest first
+- Each row carries the delivery record (channel, status, sent_at, created_at, read) **plus** a nested `alert` block (title, severity, lifecycle status, device_mac/name, current/threshold values) so the UI renders without a second roundtrip
+- `unread_count` respects the `status` filter, so the badge matches the filtered view
 
-| Old Endpoint | Replacement |
-|-------------|-------------|
-| `POST /mobile/auth/verify-firebase-token` | `POST /mobile/auth/google` or `POST /mobile/auth/apple` |
+Sister endpoint: `POST /mobile/notifications/mark-read` — body is either `{delivery_id}` for a single row or `{mark_all: true}`.
 
-### Unchanged Endpoints (no modifications needed)
+### 3. Dashboard `active_count` accuracy fix
 
-These endpoints work exactly as documented in the previous version:
+`POST /mobile/get-dashboard-stats` previously returned `active_count: 0` for every caller. The old code compared `Device.last_seen_result` to "now − 5 min", but that column was written by the legacy MariaDB sync that's no longer running, so every device had `last_seen_result = NULL` and the comparison always failed.
 
-`/mobile/auth/login`, `/mobile/auth/verify-otp`, `/mobile/auth/resend-otp`, `/mobile/auth/reset-password`, `/mobile/auth/update-password`, `/mobile/auth/refresh-token`, `/mobile/user/get-profile`, `/mobile/user/complete-profile`, `/mobile/user/update-profile`, `/mobile/user/update-status`, `/mobile/create-group`, `/mobile/add-device-to-group`, `/mobile/pair-device`
+Now the active count comes from TimescaleDB `vitals_data` directly — a device counts as active if it ingested any reading in the last 5 minutes. No request-shape changes; the field is just correct now.
 
----
+### 4. Bed `occupied_status` accuracy fix
+
+The device list endpoints (`/mobile/get-groups`, `/mobile/get-devices-with-alerts`) previously hard-coded `occupied_status` to `'unknown'`. The mobile app's fallback for "unknown" rendered as "occupied," so every bed looked occupied regardless of actual state.
+
+`occupied_status` is now derived from the latest occupancy reading in TimescaleDB and has three states:
+
+| Value | Meaning |
+|---|---|
+| `'occupied'` | Latest reading detects a body on the bed |
+| `'unoccupied'` | Latest reading is off-bed (radar reports `-1` when nothing's detected) |
+| `'unknown'` | No reading in the lookback window — distinguishes "no signal" from "confirmed empty" |
+
 
 ## Table of Contents
 
-- [Migration Guide](#migration-guide-v2-api-changes)
+- [Recent Changes](#recent-changes)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
 - [Project Structure](#project-structure)
