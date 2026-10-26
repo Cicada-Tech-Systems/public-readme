@@ -191,11 +191,12 @@ JWT tokens are obtained via `/mobile/auth/login`, `/mobile/auth/verify-otp`, `/m
 | Endpoint | Limit |
 |---|---|
 | `/mobile/auth/login` | **30 / min** |
-| `/mobile/auth/verify-otp` | **15 / min** |
+| `/mobile/auth/verify-otp` | **20 / min** |
 | `/mobile/auth/signup` | **10 / min** |
 | `/mobile/auth/resend-otp` | 5 / min (sends email) |
 | `/mobile/auth/reset-password` | 5 / min (sends email) |
-| `/mobile/accept-invite-link` | 5 / min |
+| `/mobile/auth/change-password` | **20 / min** |
+| `/mobile/accept-invite-link` | **30 / min** |
 
 ### Input Validation
 
@@ -304,6 +305,25 @@ Always returns 200. Sends a `recovery`-type OTP to the email.
 | User not found | `404` | `{message: "User not found"}` |
 
 Must call `verify-otp` with `otp_type: "recovery"` first. Password update window expires after 15 minutes.
+</details>
+
+<details>
+<summary><b>POST /mobile/auth/change-password</b> — Change password while logged in (requires JWT)</summary>
+
+**Auth:** requires JWT (`Authorization: Bearer <access_token>`). Identity is taken from the token, not the body.
+
+**Body:** `{current_password: string, new_password: string}` (each min 8 chars). For proof of possession — no OTP needed. Rate limited 20 / min.
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Password changed successfully"}` |
+| Wrong current password | `401` | `{message: "Current password is incorrect"}` |
+| OAuth-only account (no password) | `401` | `{message: "This account uses social login and has no password set"}` |
+| New password too short | `400` | `{message: "..."}` (min 8) |
+| New password same as current | `400` | `{message: "..."}` |
+| User not found | `404` | `{message: "User not found"}` |
+
+On success, all of the user's **other** sessions are invalidated (refresh tokens revoked) — other devices must log in again with the new password. Distinct from `update-password`, which is the forgot-password path gated behind a recovery OTP.
 </details>
 
 <details>
@@ -538,6 +558,8 @@ Set `delete_vitals: true` to also permanently erase all vital history from Influ
         "group_id": 1,
         "group_name": "Bedroom",
         "is_default": false,
+        "preset_theme": "master_suite",     // icon preset id (see create-group)
+        "color": "#41BBB0",                 // hex color for the group icon
         "device_count": 1,
         "devices": [
           {
@@ -605,19 +627,36 @@ Require **backend auth** + `user_name` in body.
 <details>
 <summary><b>POST /mobile/create-group</b> — Create a device group</summary>
 
-**Body:** `{user_name, group_name}`
+**Body:** `{user_name, group_name, preset_theme?, color?}`
+
+`preset_theme` (default `master_suite`) is one of the icon presets: `master_suite`, `home`, `care_watch`, `guest_quarters`, `medical`, `office`, `living_room`, `nursery`, `gym`, `garage`, `garden`, `library`, `lounge`, `dog_room`, `cat_room`, `game_room`, `aviary`, `patio`. `color` is a hex string `^#[0-9A-Fa-f]{6}$` (default `#41BBB0`).
 
 | Response | Status | Body |
 |----------|--------|------|
 | Success | `201` | `{data: {group_id: 5}, message: "Group created"}` |
-| Name empty | `400` | `{message: "group_name cannot be empty"}` |
-| Name too long | `400` | `{message: "group_name too long (max 255 characters)"}` |
+| Name empty / too long | `400` | `{message: "..."}` |
+| Unknown `preset_theme` / bad `color` | `400` | `{message: "..."}` |
 </details>
 
 <details>
-<summary><b>POST /mobile/rename-group</b> — Rename a group</summary>
+<summary><b>POST /mobile/update-group</b> — Update a group's name and/or icon theme</summary>
 
-**Body:** `{user_name, group_id, group_name}`
+**Body:** `{user_name, group_id, group_name?, preset_theme?, color?}` — send only the fields that changed (partial update; unset fields are preserved). Superset of `rename-group`.
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{message: "Group updated"}` |
+| Not found / not owner | `404` | `{message: "Group not found"}` |
+| Renaming the default group | `400` | `{message: "Cannot rename the default group"}` (theme/color changes on the default group are allowed) |
+| Unknown `preset_theme` / bad `color` / empty name | `400` | `{message: "..."}` |
+
+`preset_theme` accepts the same 18 presets listed under `create-group`.
+</details>
+
+<details>
+<summary><b>POST /mobile/rename-group</b> — Rename a group (subset of update-group)</summary>
+
+**Body:** `{user_name, group_id, group_name}`. Kept for backward compatibility; new clients should use `update-group`.
 
 | Response | Status | Body |
 |----------|--------|------|
@@ -924,6 +963,25 @@ Per row:
 - `invitation_id` — set on Pending rows so the mobile app has a stable row key when `id` is null. `null` on Active rows. Use this to target `/mobile/cancel-invitation`, `/mobile/update-invitation`, or `/mobile/resend-invitation` directly without going through email.
 
 **Who can call:** Any user with access to the device (owner, manager, caregiver, viewer).
+</details>
+
+<details>
+<summary><b>POST /mobile/transfer-device-ownership</b> — Hand the owner role to another existing user on the device</summary>
+
+**Body:** `{user_name, device_id, new_owner_user_id, demoted_role?: "manager"|"caregiver"|"viewer"}`
+
+The target user **must already have a role** on the device (invite + accept first — this endpoint does not invite strangers). Owner-only. Atomic: the current owner is demoted to `demoted_role` (default `manager`) and the target is promoted to `owner` in one transaction, so the device is never ownerless. Alert rules, groups, and other shared roles are untouched.
+
+| Response | Status | Body |
+|----------|--------|------|
+| Success | `200` | `{data: {previous_owner_user_id, new_owner_user_id}}` |
+| Caller is not the owner | `401` | `{message: "Only the current device owner can transfer ownership"}` |
+| Target has no role on device | `404` | `{message: "Target user has no access to this device. Invite them first."}` |
+| Target user not found | `404` | `{message: "Target user not found"}` |
+| Already the owner | `200` | no-op: `{data: {previous_owner_user_id, new_owner_user_id}}` (both equal) |
+| Concurrent ownership change | `409` | `{message: "Ownership transfer failed — another concurrent change won"}` |
+
+The new owner gets a role-change push + email (gated by their notification prefs).
 </details>
 
 <details>
