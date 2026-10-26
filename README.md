@@ -191,12 +191,12 @@ JWT tokens are obtained via `/mobile/auth/login`, `/mobile/auth/verify-otp`, `/m
 | Endpoint | Limit |
 |---|---|
 | `/mobile/auth/login` | **30 / min** |
-| `/mobile/auth/verify-otp` | **15 / min** |
+| `/mobile/auth/verify-otp` | **20 / min** |
 | `/mobile/auth/signup` | **10 / min** |
 | `/mobile/auth/resend-otp` | 5 / min (sends email) |
 | `/mobile/auth/reset-password` | 5 / min (sends email) |
-| `/mobile/auth/change-password` | 5 / min |
-| `/mobile/accept-invite-link` | 5 / min |
+| `/mobile/auth/change-password` | **20 / min** |
+| `/mobile/accept-invite-link` | **30 / min** |
 
 ### Input Validation
 
@@ -312,7 +312,7 @@ Must call `verify-otp` with `otp_type: "recovery"` first. Password update window
 
 **Auth:** requires JWT (`Authorization: Bearer <access_token>`). Identity is taken from the token, not the body.
 
-**Body:** `{current_password: string, new_password: string}` (each min 8 chars). For proof of possession — no OTP needed. Rate limited 5 / min.
+**Body:** `{current_password: string, new_password: string}` (each min 8 chars). For proof of possession — no OTP needed. Rate limited 20 / min.
 
 | Response | Status | Body |
 |----------|--------|------|
